@@ -5,7 +5,8 @@
 #   REPOS=/root/racksdock PLATFORM_URL=http://127.0.0.1:8000 PROFILE=rtx4090x8-dev TRUST_MODE=dev bash setup-host.sh
 #
 # Inputs (environment):
-#   REPOS          directory holding racksdock-subnet, racksdock-node, racksdock-platform (default: three levels up from this file)
+#   REPOS          directory holding racksdock-subnet and racksdock-node (plus racksdock-platform for single-box tests;
+#                  a real miner node does not need it); default: three levels up from this file
 #   PLATFORM_URL   marketplace HTTP URL (dev trust mode fetches the dev CA and this node's simulated identity from it);
 #                  empty = single-box test: a local dev CA is created in /etc/racksdock/devca (the marketplace reuses it)
 #   PLATFORM_WS    host-agent WebSocket (default: PLATFORM_URL with ws:// and /v1/hosts/ws)
@@ -22,6 +23,7 @@
 #   HUGEPAGE_KIB   1048576 to back the VM with 1 GiB hugepages (reserve them at boot first); default 0
 #   PYTHON         interpreter >= 3.11 for the racksdock venv (default: python3.11 or python3; deadsnakes is added on 22.04)
 set -euo pipefail
+trap 'echo "setup-host.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPOS="${REPOS:-$(cd "$HERE/../../.." && pwd)}"
@@ -65,18 +67,19 @@ virsh net-info default | grep -E 'Active|Bridge'
 
 step "4. GPU facts (before the host driver is unloaded)"
 mkdir -p /etc/racksdock
-if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
-  MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')
-  PCI_ID=$(nvidia-smi --query-gpu=pci.device_id --format=csv,noheader | head -1 | tr -d ' ' | sed -E 's/^0x([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})$/\2:\1/' | tr 'A-F' 'a-f')
-  NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+# (query GPU 0 only: "| head -1" after an 8-line nvidia-smi trips pipefail with SIGPIPE and aborts the script silently)
+if command -v nvidia-smi >/dev/null && nvidia-smi -i 0 -L >/dev/null 2>&1; then
+  MEM_MIB=$(nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')
+  PCI_ID=$(nvidia-smi -i 0 --query-gpu=pci.device_id --format=csv,noheader | tr -d ' ' | sed -E 's/^0x([0-9A-Fa-f]{4})([0-9A-Fa-f]{4})$/\2:\1/' | tr 'A-F' 'a-f')
+  NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader)
   printf '{"pci_id": "%s", "memory_mib": %s, "name": "%s"}\n' "$PCI_ID" "$MEM_MIB" "$NAME" > /etc/racksdock/gpu-facts.json
 fi
-[ -f /etc/racksdock/gpu-facts.json ] || { PCI_ID=$(lspci -Dn | awk '$2 ~ /^030[02]:/ && $3 ~ /^10de:/ {print $3; exit}'); printf '{"pci_id": "%s", "memory_mib": %s, "name": "unknown"}\n' "$PCI_ID" "${GPU_MEMORY_MIB:-0}" > /etc/racksdock/gpu-facts.json; }
+[ -f /etc/racksdock/gpu-facts.json ] || { PCI_ID=$(lspci -Dn | awk '$2 ~ /^030[02]:/ && $3 ~ /^10de:/ && !found {print $3; found=1}'); printf '{"pci_id": "%s", "memory_mib": %s, "name": "unknown"}\n' "$PCI_ID" "${GPU_MEMORY_MIB:-0}" > /etc/racksdock/gpu-facts.json; }
 cat /etc/racksdock/gpu-facts.json
 
 step "5. unload the host NVIDIA driver (the GPUs belong to the VM from now on)"
 systemctl stop nvidia-persistenced nvidia-fabricmanager nvidia-dcgm 2>/dev/null || true
-if lsmod | grep -q '^nvidia'; then
+if grep -q '^nvidia' /proc/modules; then
   if ! (rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null || rmmod nvidia_uvm nvidia 2>/dev/null); then
     echo "WARNING: NVIDIA modules still in use (GPU processes or containers running: nvidia-smi / fuser -v /dev/nvidia*)."
     echo "         Stop them and rerun, or reboot (the blacklist is installed) and rerun."; exit 1
@@ -101,7 +104,11 @@ for a in $(jq -r '.gpu_pci[], .extra_pci[]' /etc/racksdock/resources.json); do p
 step "8. racksdock software -> /opt/racksdock/venv"
 [ -d /opt/racksdock/venv ] || "$PY" -m venv /opt/racksdock/venv
 /opt/racksdock/venv/bin/pip install -q --upgrade pip
-/opt/racksdock/venv/bin/pip install -q -e "$REPOS/racksdock-subnet[validator]" -e "$REPOS/racksdock-node[nvml]" -e "$REPOS/racksdock-platform"
+# a miner's server needs racksdock-subnet (schemas, verifier, miner neuron) and racksdock-node (host-agent); racksdock-platform
+# (marketplace + tenant CLI) is the owner's software and is installed only when present, for single-box tests
+PKGS=(-e "$REPOS/racksdock-subnet[validator]" -e "$REPOS/racksdock-node[nvml]")
+[ -d "$REPOS/racksdock-platform" ] && PKGS+=(-e "$REPOS/racksdock-platform")
+/opt/racksdock/venv/bin/pip install -q "${PKGS[@]}"
 mkdir -p /var/lib/racksdock/images /var/lib/racksdock/vms /var/lib/racksdock-host-agent
 
 TRUST_ENV=""

@@ -5,6 +5,7 @@
 # Needs: qemu-utils, libguestfs-tools (virt-customize), curl, a Python >= 3.11 with pip (PYTHON) to build the racksdock wheels.
 # Afterwards: racksdock-images manifest build <OUT_DIR> <release> && racksdock-images manifest sign ... (docs/images.md)
 set -euo pipefail
+trap 'echo "build.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 OS="$1"; RELEASE="$2"; DRIVER="${3:-580.82.07}"; CUDA="${4:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT_DIR:-$HERE/out}"; CACHE="${CACHE_DIR:-$HERE/cache}"; mkdir -p "$OUT" "$CACHE"
