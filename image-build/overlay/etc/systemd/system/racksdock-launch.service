@@ -1,6 +1,8 @@
 [Unit]
 Description=racksdock tenant launch configuration (startup script or Docker container)
-After=cloud-final.service docker.service network-online.target
+# launch.json is written by cloud-init's init stage; the tenant user-data's runcmd also starts this unit explicitly.
+# Not ordered after cloud-final.service (it runs after multi-user.target: ordering cycle, see racksdock-node-agent.service).
+After=cloud-config.service docker.service network-online.target
 Wants=docker.service
 
 [Service]

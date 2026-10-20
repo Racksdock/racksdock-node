@@ -1,6 +1,9 @@
 [Unit]
 Description=racksdock node agent (attestation, status, allowlisted health)
-After=network-online.target cloud-init.target
+# After cloud-init's init and config stages: the user-data copy, SSH host keys and vendor-data files exist by then.
+# Never order after cloud-init.target or cloud-final.service: both run after multi-user.target, and a multi-user unit
+# ordered after them creates a systemd ordering cycle that silently drops this unit on some boots.
+After=network-online.target cloud-init.service cloud-config.service
 Wants=network-online.target
 
 [Service]

@@ -119,7 +119,7 @@ could read VM memory; no CC in this design.
 | `virsh start ... failed: ... vfio ... group is not viable` | host-agent.log | a device in a GPU's IOMMU group is not bound: `racksdock-discover-resources` prints `PROBLEM` lines; bind it or move the card |
 | `virsh start ... failed: ... apparmor` / `Permission denied` on the qcow2 | host-agent.log | `echo 'security_driver = "none"' >> /etc/libvirt/qemu.conf; systemctl restart libvirtd` (lab fallback) |
 | `no DHCP lease for racksdock-...` | host-agent.log | guest did not get an address: `virsh console <name>`; `virsh net-dhcp-leases default`; check `virsh net-info default` is active |
-| bootstrap waits with VM `running`, nothing in host-agent.log | runner | node-agent not connecting over vsock: `virsh console`, inside the VM `journalctl -u racksdock-node-agent`; on the host `lsmod | grep vhost_vsock` |
+| VM `running` + `forwarding` logged, but no `node-agent hello` within 2 min | host-agent.log | look at `/var/lib/racksdock/vms/<instance>/console.log`: `Ordering cycle found, skipping racksdock-node-agent.service` means the image carries a unit ordered after `cloud-init.target` (fixed 2026-10-20; `dev/vmtest/patch-images.sh` refreshes the units in built images). Otherwise log into the VM (validator VMs: `ssh -i /var/lib/racksdock-vmtest/validator-state/ssh_ed25519 -p 20022 ubuntu@172.19.4.67`) and read `journalctl -u racksdock-node-agent -b`; on the host `lsmod | grep vhost_vsock` |
 | `user-data hash mismatch` | marketplace / instance `error` | the VM's cloud-init copy differs from the platform's string; compare `/var/lib/cloud/instance/user-data.txt` in the VM with the request |
 | Q8 fails or times out | validator.log, evidence `qualification` | GeForce NCCL over host memory is slow; drop `Q8` from `checks` in `rtx4090x8-dev.json`, restart the runner |
 | Q11 fails: `/data` missing | validator.log | the data disk was not set up: inside the VM `lsblk`, `journalctl -u racksdock-node-agent` (cryptsetup errors) |
@@ -127,7 +127,9 @@ could read VM memory; no CC in this design.
 | image build: driver package not found | build-images.sh | pass `DRIVER=<version listed by apt-cache search nvidia-driver- | grep server-open>` |
 
 Inside a VM: in dev trust mode the host-agent adds the key named by `RACKSDOCK_DEV_SSH_PUBKEY` (set by `setup-host.sh` to the
-key you use for the box) to every VM, so `ssh -p 20022 ubuntu@172.19.4.67` works for the bootstrap and verify VMs too. There:
+key you use for the box) to the **bootstrap** VM (empty user-data). Validator and tenant VMs define their own user list, which makes
+cloud-init ignore extra keys; use the validator's key (`/var/lib/racksdock-vmtest/validator-state/ssh_ed25519`) or the tenant key
+(`/var/lib/racksdock-vmtest/demo_key`) for those. The port always points at the newest VM. There:
 `sudo journalctl -u racksdock-node-agent -b --no-pager`, `cloud-init status --long`, `ls -R /etc/racksdock`, `lsmod | grep vsock`,
 `nvidia-smi`. The VM's boot console is kept at `/var/lib/racksdock/vms/<instance>/console.log` on the host.
 
