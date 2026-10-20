@@ -62,6 +62,17 @@ LogLevel ERROR
         self.proc.wait(5)
 
 
+def test_tenant_blocks_never_accumulate(tmp_path):
+    ak = tmp_path / "authorized_keys"
+    ak.write_text("ssh-ed25519 OPERATOR operator\n# >>> racksdock tenant keys >>>\nssh-ed25519 OLD stale-validator\n# <<< racksdock tenant keys <<<\n")
+    b = StaticBackend(0, "127.0.0.1", 22, ak, ssh_service=None)
+    b._apply_keys(["ssh-ed25519 NEW tenant"])
+    text = ak.read_text()
+    assert "OPERATOR" in text and "NEW" in text and "OLD" not in text and text.count("# >>> racksdock tenant keys >>>") == 1
+    b._restore_keys()
+    assert ak.read_text() == "ssh-ed25519 OPERATOR operator\n"
+
+
 def test_tenant_keys_are_parsed_from_user_data():
     ud = render(UserDataInput(ssh_public_keys=["ssh-ed25519 AAAA a", "ssh-ed25519 BBBB b"]))
     assert StaticBackend.tenant_keys(ud) == ["ssh-ed25519 AAAA a", "ssh-ed25519 BBBB b"]

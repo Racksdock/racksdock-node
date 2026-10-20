@@ -51,20 +51,37 @@ class StaticBackend:
                 keys += [k for k in (u.get("ssh_authorized_keys") or []) if isinstance(k, str)]
         return keys
 
+    MARK_START, MARK_END = "# >>> racksdock tenant keys >>>", "# <<< racksdock tenant keys <<<"
+
+    @classmethod
+    def strip_tenant_blocks(cls, text: str) -> str:
+        """Remove every racksdock tenant block, so a previous session's keys never survive into the baseline."""
+        out, skipping = [], False
+        for line in text.splitlines():
+            if line.strip() == cls.MARK_START:
+                skipping = True
+                continue
+            if line.strip() == cls.MARK_END:
+                skipping = False
+                continue
+            if not skipping:
+                out.append(line)
+        return "\n".join(out).rstrip("\n")
+
     def _apply_keys(self, keys: list[str]) -> None:
         self.authorized_keys.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self._baseline is None:
-            self._baseline = self.authorized_keys.read_text() if self.authorized_keys.exists() else ""
-        marker_start, marker_end = "# >>> racksdock tenant keys >>>", "# <<< racksdock tenant keys <<<"
-        body = self._baseline.rstrip("\n")
-        block = "\n".join([marker_start, *keys, marker_end])
-        self.authorized_keys.write_text((body + "\n" if body else "") + block + "\n")
+        current = self.authorized_keys.read_text() if self.authorized_keys.exists() else ""
+        self._baseline = self.strip_tenant_blocks(current)  # always recomputed: only the operator's own keys stay
+        block = "\n".join([self.MARK_START, *keys, self.MARK_END])
+        self.authorized_keys.write_text((self._baseline + "\n" if self._baseline else "") + block + "\n")
         self.authorized_keys.chmod(0o600)
 
     def _restore_keys(self) -> None:
-        if self._baseline is not None:
-            self.authorized_keys.write_text(self._baseline)
-            self.authorized_keys.chmod(0o600)
+        if not self.authorized_keys.exists():
+            return
+        base = self.strip_tenant_blocks(self.authorized_keys.read_text())
+        self.authorized_keys.write_text(base + "\n" if base else "")
+        self.authorized_keys.chmod(0o600)
 
     async def launch(self, spec: VmSpec) -> VmHandle:
         self.state_dir.mkdir(parents=True, exist_ok=True)
