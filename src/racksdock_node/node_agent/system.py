@@ -40,6 +40,28 @@ def read_user_data(cfg, fallback: str | None) -> bytes:
         return b""
 
 
+def resolve_data_device(cfg) -> str | None:
+    """The block device that becomes the encrypted /data: the configured path, the host-agent's virtio data disk, or a
+    passed-through NVMe namespace that is not the root disk and is not mounted. None if this VM has no data disk."""
+    for cand in (cfg.data_device, "/dev/disk/by-id/virtio-racksdock-data"):
+        if cand and Path(cand).exists():
+            return cand
+    try:
+        mounts = Path("/proc/mounts").read_text()
+    except OSError:
+        mounts = ""
+    root_src = ""
+    for line in mounts.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1] == "/":
+            root_src = parts[0]
+    for ns in sorted(Path("/dev").glob("nvme*n1")):
+        if root_src.startswith(str(ns)) or f"{ns} " in mounts or f"{ns}p" in mounts:
+            continue
+        return str(ns)
+    return None
+
+
 def launch_status(cfg) -> str | None:
     if cfg.sim:
         return "started"
@@ -57,15 +79,19 @@ class DataDisk:
         self.key: bytearray | None = None
         self.mapper = "racksdockdata"
         self.opened = False  # erase() only touches what open() set up
+        self.device: str | None = None
 
     def open(self) -> bool:
+        if self.opened:
+            return True
         if self.cfg.sim:
             self.key = bytearray(secrets.token_bytes(64))
             self.opened = True
             return True
-        dev = self.cfg.data_device
-        if not Path(dev).exists() or shutil.which("cryptsetup") is None:
+        dev = resolve_data_device(self.cfg)
+        if dev is None or shutil.which("cryptsetup") is None:
             return False
+        self.device = dev
         self.key = bytearray(secrets.token_bytes(64))
         keyfile = Path("/run/racksdock/data.key")
         keyfile.parent.mkdir(parents=True, exist_ok=True)
@@ -97,5 +123,5 @@ class DataDisk:
             return  # never unmount or erase devices this agent did not set up
         subprocess.run(["umount", "-l", str(self.cfg.data_mount)], check=False, capture_output=True)
         subprocess.run(["cryptsetup", "close", self.mapper], check=False, capture_output=True)
-        subprocess.run(["cryptsetup", "luksErase", "--batch-mode", self.cfg.data_device], check=False, capture_output=True)
+        subprocess.run(["cryptsetup", "luksErase", "--batch-mode", self.device or self.cfg.data_device], check=False, capture_output=True)
         subprocess.run(["sync"], check=False)

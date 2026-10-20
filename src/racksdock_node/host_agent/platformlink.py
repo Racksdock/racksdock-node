@@ -50,6 +50,7 @@ class PlatformLink:
                         await ws.send(self._outbox.popleft())
                     self.connected.set()
                     backoff = 1.0
+                    log.info("connected to platform %s", self.url)
                     async for raw in ws:
                         try:
                             cmd = HostCommand.model_validate(json.loads(raw))

@@ -13,3 +13,31 @@ Responsibilities
 Modes: `RACKSDOCK_HOST_AGENT_MODE=real` (libvirt/QEMU) or `sim` (the "VM" is a `racksdock-node-agent --mode sim` process plus a fake SSH banner listener; used by the simulator and tests).
 
 `host-image/` (repo root) holds the mkosi configuration and first-boot scripts for the host OS.
+
+## Networking modes (`RACKSDOCK_NET_MODE`)
+
+- `bridge` (default): the VM gets `RACKSDOCK_PUBLIC_IP` on `RACKSDOCK_NET_BRIDGE`; one public IP per node.
+- `nat`: the VM sits on the libvirt NAT network `RACKSDOCK_NAT_NETWORK` (default `default`) and the host forwards
+  `host:RACKSDOCK_NAT_SSH_PORT` (default 20022) to VM:22 with tagged iptables rules (`racksdock-nat-<instance>`), installed once the
+  guest has its DHCP lease and removed at teardown. `RACKSDOCK_PUBLIC_IP` is then the host address tenants connect to (auto-detected
+  from the default route when unset). For single-IP hosts and lab boxes.
+- A passed-through NIC VF (`nic_vf_pci` in resources.json) replaces both.
+
+## Host preparation and resources
+
+`host-image/scripts/setup-host.sh` turns an existing Ubuntu 22.04/24.04 bare-metal server into a host without reimaging
+(packages, modules, libvirt network, driver unbinding, resource discovery, vfio binding, venv, env). `racksdock-discover-resources`
+writes `/etc/racksdock/resources.json` (`VmResources`): GPUs, `extra_pci` (other endpoint functions in a GPU's IOMMU group, e.g.
+GeForce audio), NVSwitches, free non-root NVMe controllers (only with `--passthrough-nvme`: they are crypto-erased after every
+rental), CPU/memory budget, `data_disk_gb` (virtio data disk when no NVMe is passed through), `hugepage_kib` (0 = no hugepage
+backing), `pci_mmio64_mb` (OVMF 64-bit MMIO window; 8xB300 needs about 2 TB). `bind-vfio.sh` binds the GPUs plus their IOMMU-group
+companions and the listed NVMe/NIC functions.
+
+At start in `real` mode the host-agent destroys stale `racksdock-*` VMs and tagged NAT rules (no VM may survive a host-agent
+restart; it would hold the GPUs) and logs `preflight:` problems (tools, OVMF, /dev/kvm, vhost_vsock, libvirt network, vfio binding,
+hugepages). Images are addressed by catalog version: `<image_dir>/<os>_<release>.qcow2`, verified against
+`manifest.signed.json` + `catalog.pub` in the same directory.
+
+In dev trust mode on real hardware (GPUs without device attestation) the host passes the dev CA certificates (never its private
+keys), the node's simulated identity and `/etc/racksdock/node-agent.env` to the VM through cloud-init vendor-data. Production hosts
+have no dev CA material and pass nothing.

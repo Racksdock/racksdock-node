@@ -38,6 +38,7 @@ class NodeAgent:
         self.host_key_line = ensure_host_key_line(cfg)
         self._stop = asyncio.Event()
         self._metrics_server = None
+        self._last_status: dict | None = None
 
     def _make_collector(self):
         # dev trust mode uses the dev CA even on real hardware (e.g. Ampere GPUs, which have no device attestation)
@@ -71,18 +72,30 @@ class NodeAgent:
         if self._metrics_server:
             self._metrics_server.close()
 
-    async def _session(self, conn: AgentConnection) -> None:
+    async def _hello(self, conn: AgentConnection) -> None:
         await conn.send(AgentMessage(type="hello", payload={
             "node_agent_pubkey": self.key.public.hex, "node_agent_version": __version__,
             "image_version": self.cfg.image_version, "ssh_host_key_line": self.host_key_line,
             "booted": self.meta is not None,
         }))
+
+    async def _session(self, conn: AgentConnection) -> None:
+        await self._hello(conn)
         while True:
-            msg = await conn.recv()
+            try:
+                # a real VM can boot before the host-agent has registered it; repeat hello until metadata arrives
+                msg = await asyncio.wait_for(conn.recv(), timeout=10 if self.meta is None else None)
+            except TimeoutError:
+                await self._hello(conn)
+                continue
             if msg is None:
                 raise ConnectionError("host closed")
             if msg.type == "metadata":
-                self.meta = Metadata.model_validate(msg.payload)
+                meta = Metadata.model_validate(msg.payload)
+                if self.meta is not None and self.meta.instance_id == meta.instance_id and self._last_status is not None:
+                    await conn.send(AgentMessage(type="status", payload=self._last_status))  # already booted; host-agent reconnected
+                    continue
+                self.meta = meta
                 await self._boot(conn)
             elif msg.type == "challenge":
                 await self._challenge(conn, msg)
@@ -128,9 +141,9 @@ class NodeAgent:
             except OSError as e:
                 log.warning("metrics server not started: %s", e)
         ls = launch_status(self.cfg)
-        await conn.send(AgentMessage(type="status", payload=StatusUpdate(
-            status=InstanceStatus.active, status_details=None if ok else "cloud-init reported errors",
-            ssh_port=m.ssh_port, ssh_host_key_line=self.host_key_line, launch_status=ls).model_dump(mode="json")))
+        self._last_status = StatusUpdate(status=InstanceStatus.active, status_details=None if ok else "cloud-init reported errors",
+                                         ssh_port=m.ssh_port, ssh_host_key_line=self.host_key_line, launch_status=ls).model_dump(mode="json")
+        await conn.send(AgentMessage(type="status", payload=self._last_status))
 
     # ---- validator challenges ----------------------------------------------
     async def _challenge(self, conn: AgentConnection, msg: AgentMessage) -> None:

@@ -10,14 +10,16 @@ import yaml
 from racksdock_subnet.core.agentproto import Metadata
 
 
-def vendor_data(meta: Metadata) -> str:
-    cfg = {
-        "write_files": [
-            {"path": "/etc/racksdock/metadata.json", "permissions": "0644", "content": json.dumps(meta.model_dump(exclude={"user_data"}), sort_keys=True) + "\n"},
-            {"path": "/etc/racksdock/image-version", "permissions": "0644", "content": meta.image_version + "\n"},
-        ]
-    }
-    return "#cloud-config\n" + yaml.safe_dump(cfg, sort_keys=True)
+def vendor_data(meta: Metadata, extra_files: dict[str, str] | None = None) -> str:
+    """Platform metadata for the node-agent. `extra_files` (path -> content) are written root-only; the host-agent uses them to
+    hand dev-trust-mode material (dev CA, simulated node identity, node-agent env) to a real VM. Never used in production."""
+    files = [
+        {"path": "/etc/racksdock/metadata.json", "permissions": "0644", "content": json.dumps(meta.model_dump(exclude={"user_data"}), sort_keys=True) + "\n"},
+        {"path": "/etc/racksdock/image-version", "permissions": "0644", "content": meta.image_version + "\n"},
+    ]
+    for path, content in sorted((extra_files or {}).items()):
+        files.append({"path": path, "permissions": "0600", "owner": "root:root", "content": content})
+    return "#cloud-config\n" + yaml.safe_dump({"write_files": files}, sort_keys=True)
 
 
 def meta_data(instance_id: str, hostname: str) -> str:
@@ -34,10 +36,11 @@ def network_config(public_ip: str | None, gateway: str | None = None, prefix: in
     return yaml.safe_dump(cfg, sort_keys=True)
 
 
-def build_seed_iso(path: Path, user_data: str, meta: Metadata, hostname: str, net_cfg: str | None = None) -> Path:
+def build_seed_iso(path: Path, user_data: str, meta: Metadata, hostname: str, net_cfg: str | None = None,
+                   extra_files: dict[str, str] | None = None) -> Path:
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, rock_ridge="1.09", vol_ident="CIDATA")
-    files = {"user-data": user_data, "meta-data": meta_data(meta.instance_id, hostname), "vendor-data": vendor_data(meta)}
+    files = {"user-data": user_data, "meta-data": meta_data(meta.instance_id, hostname), "vendor-data": vendor_data(meta, extra_files)}
     if net_cfg:
         files["network-config"] = net_cfg
     for i, (name, content) in enumerate(files.items()):

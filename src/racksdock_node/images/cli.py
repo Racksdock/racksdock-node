@@ -35,10 +35,15 @@ def build(image_dir: Path, release: str, out: Path = Path("manifest.json"), driv
 
 
 @man.command("sign")
-def sign(manifest: Path, key: Path, out: Path = Path("manifest.signed.json")):
+def sign(manifest: Path, key: Path, out: Path = Path("manifest.signed.json"), pub_out: Path | None = None):
+    """Sign a manifest with the catalog key (created if missing). --pub-out writes the public key (hex) the host-agent needs as
+    catalog.pub next to the images."""
     m = CatalogManifest.model_validate_json(manifest.read_text())
-    env = sign_manifest(m, SigningKey.load_or_create(key))
+    sk = SigningKey.load_or_create(key)
+    env = sign_manifest(m, sk)
     out.write_text(env.model_dump_json(indent=1))
+    if pub_out is not None:
+        pub_out.write_text(sk.public.hex + "\n")
     typer.echo(f"signed by {env.signer}")
 
 

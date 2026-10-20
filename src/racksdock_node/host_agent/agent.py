@@ -70,7 +70,25 @@ class HostAgent:
                                  self.cfg.sim_node_agent_cmd, env, self.cfg.state_dir / "static", ssh_service=self.cfg.static_ssh_service)
         from .hypervisor.libvirt_backend import LibvirtBackend
 
-        return LibvirtBackend(bridge=self.cfg.network.bridge, public_ip=self.cfg.network.public_ip)
+        n = self.cfg.network
+        return LibvirtBackend(bridge=n.bridge, public_ip=n.public_ip, net_mode=n.mode, nat_network=n.nat_network, nat_ssh_port=n.nat_ssh_port,
+                              guest_files=self._dev_guest_files())
+
+    def _dev_guest_files(self) -> dict[str, str]:
+        """Dev trust mode on real hardware (GPUs without device attestation): the VM needs the dev CA certificates and this node's
+        simulated identity, which the host hands over through cloud-init vendor-data. Private CA keys never leave the platform;
+        the node's simulated device keys are the dev stand-in for keys a real GPU holds in hardware. Empty in production."""
+        t = self.cfg.trust
+        if not t.dev or t.dev_ca_dir is None or self.cfg.sim_node_dir is None:
+            return {}
+        files = {"/etc/racksdock/node-agent.env": "RACKSDOCK_TRUST_MODE=dev\nRACKSDOCK_DEV_CA_DIR=/etc/racksdock/devca\nRACKSDOCK_SIM_NODE_DIR=/etc/racksdock/node\n"}
+        for src, dst in ((Path(t.dev_ca_dir), "/etc/racksdock/devca"), (Path(self.cfg.sim_node_dir), "/etc/racksdock/node")):
+            if not src.exists():
+                raise RuntimeError(f"dev trust mode: {src} missing (racksdock-verify devca fetch / fetch-node)")
+            for f in sorted(src.rglob("*")):
+                if f.is_file() and not (dst.endswith("devca") and f.suffix == ".key"):
+                    files[f"{dst}/{f.relative_to(src)}"] = f.read_text()
+        return files
 
     def _load_node_id(self) -> str | None:
         p = self.cfg.state_dir / "node_id"
@@ -84,10 +102,22 @@ class HostAgent:
         })
 
     async def run(self) -> None:
+        log.info("host-agent started: mode=%s node_id=%s host_key=%s platform=%s region=%s", self.cfg.mode, (self.node_id or "unregistered")[:24],
+                 self.key.public.hex[:12], self.cfg.platform_ws, self.cfg.region)
         await self.agentlink.start()
         if self.cfg.sim or self.cfg.static:
             # process-based backends need the actual bound port
             self.backend.agent_port = self.agentlink.port  # type: ignore[attr-defined]
+        else:
+            cleanup = getattr(self.backend, "cleanup_stale", None)
+            if cleanup is not None:
+                stale = await cleanup(self.cfg.vm_dir)
+                if stale:
+                    log.warning("removed %d stale VM(s) left by a previous host-agent: %s", len(stale), ", ".join(stale))
+            preflight = getattr(self.backend, "preflight", None)
+            if preflight is not None:
+                for problem in await preflight(self.cfg.resources):
+                    log.warning("preflight: %s", problem)
         hb = asyncio.create_task(self._heartbeat_loop())
         try:
             await self.platform.run()
@@ -110,6 +140,8 @@ class HostAgent:
 
     # ---- platform commands ---------------------------------------------------
     async def _on_command(self, cmd: HostCommand) -> None:
+        if cmd.kind != "ping":
+            log.info("command %s instance=%s", cmd.kind, cmd.instance_id or "-")
         self.log.record(cmd.kind, command_id=cmd.command_id, instance_id=cmd.instance_id)
         handler = getattr(self, f"_cmd_{cmd.kind}", None)
         if handler is None:
@@ -138,7 +170,7 @@ class HostAgent:
                             image_version=lc.image_version, user_data=lc.user_data, ssh_port=lc.ssh_port)
             spec = VmSpec(instance_id=lc.instance_id, image=lc.image, image_version=lc.image_version, user_data=lc.user_data, metadata=meta,
                           resources=self.cfg.resources, vm_dir=self.cfg.vm_dir / lc.instance_id,
-                          image_path=self.cfg.image_dir / f"{lc.image}_{lc.image_version}.qcow2", hostname=f"racksdock-{lc.instance_id[-8:]}",
+                          image_path=self.cfg.image_dir / f"{lc.image_version}.qcow2", hostname=f"racksdock-{lc.instance_id[-8:]}",
                           public_ip=self.cfg.network.public_ip, ssh_port=lc.ssh_port)
             self.current_launch = lc
             self._teardown_ack.clear()
@@ -297,6 +329,7 @@ class HostAgent:
             await self.platform.send(HostEvent(kind="evidence", node_id=self.node_id, instance_id=iid, payload=env.model_dump()))
         elif msg.type == "status":
             upd = StatusUpdate.model_validate(msg.payload)
+            log.info("instance %s -> %s %s", iid, upd.status.value, upd.status_details or "")
             upd.ip = self.current.ip
             upd.ssh_port = self.current.ssh_port
             if upd.status == InstanceStatus.active:

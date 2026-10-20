@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Discover what this host hands to the whole-node VM and write /etc/racksdock/resources.json
+(schema: racksdock_subnet.core.schemas.VmResources). Standard library only; runs with the system python3.
+
+  GPUs        every NVIDIA GPU function (class 0300/0302)
+  extra_pci   other endpoint functions in a GPU's IOMMU group (GeForce audio functions); VFIO needs the whole group
+  NVSwitch    class 0680, vendor 10de
+  NVMe        with --passthrough-nvme: every controller except the root disk's that has no mounted/held namespace
+  CPU/memory  all CPUs minus --reserve-cpus, MemTotal minus --reserve-mem-gb (or explicit --vcpus/--memory-gb)
+  data disk   --data-disk-gb: a virtio qcow2 data disk when no NVMe is passed through (default 500 if the VM dir has room)
+Problems (an unrelated device in a GPU's IOMMU group, no IOMMU, ...) go to stderr and exit code 2.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PCI = Path("/sys/bus/pci/devices")
+
+
+def read(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return ""
+
+
+def pci_class(addr: str) -> str:
+    return read(PCI / addr / "class")
+
+
+def vendor(addr: str) -> str:
+    return read(PCI / addr / "vendor")
+
+
+def group_members(addr: str) -> list[str]:
+    d = PCI / addr / "iommu_group" / "devices"
+    return sorted(p.name for p in d.iterdir()) if d.exists() else [addr]
+
+
+def is_bridge(addr: str) -> bool:
+    return pci_class(addr).startswith(("0x0604", "0x0600"))
+
+
+def nvme_controllers() -> dict[str, str]:
+    """controller name -> PCI address"""
+    out = {}
+    for c in sorted(Path("/sys/class/nvme").glob("nvme*")):
+        dev = (c / "device").resolve().name
+        if ":" in dev:
+            out[c.name] = dev
+    return out
+
+
+def block_in_use(name: str) -> bool:
+    mounts = read(Path("/proc/mounts")) + "\n" + read(Path("/proc/swaps"))
+    if f"/dev/{name} " in mounts or f"/dev/{name}p" in mounts:
+        return True
+    blk = Path("/sys/block") / name
+    if blk.exists():
+        if any((blk / "holders").iterdir()) if (blk / "holders").exists() else False:
+            return True
+        for part in blk.glob(f"{name}p*"):
+            if (part / "holders").exists() and any((part / "holders").iterdir()):
+                return True
+    return False
+
+
+def root_controller() -> str | None:
+    try:
+        src = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "/"], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.match(r"(nvme\d+)n\d+(p\d+)?$", Path(src).name)  # nvme0n1p2 -> nvme0
+    return m.group(1) if m else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", type=Path, default=Path("/etc/racksdock/resources.json"))
+    ap.add_argument("--reserve-cpus", type=int, default=8)
+    ap.add_argument("--reserve-mem-gb", type=int, default=64)
+    ap.add_argument("--vcpus", type=int, default=0, help="override (default: all minus reserve)")
+    ap.add_argument("--memory-gb", type=int, default=0, help="override (default: MemTotal minus reserve)")
+    ap.add_argument("--os-disk-gb", type=int, default=200)
+    ap.add_argument("--data-disk-gb", type=int, default=-1, help="virtio data disk size; -1 = auto (500 when no NVMe is passed through), 0 = none")
+    ap.add_argument("--passthrough-nvme", action="store_true", help="pass free non-root NVMe controllers through (they are CRYPTO-ERASED after every rental)")
+    ap.add_argument("--hugepage-kib", type=int, default=0, help="1048576 for 1 GiB hugepage backing (pages must be reserved at boot); 0 = none")
+    ap.add_argument("--pci-mmio64-mb", type=int, default=0, help="OVMF 64-bit MMIO window (8xB300: 2048000); 0 = OVMF default")
+    ap.add_argument("--vm-dir", type=Path, default=Path("/var/lib/racksdock/vms"))
+    a = ap.parse_args()
+
+    problems: list[str] = []
+    if not Path("/sys/kernel/iommu_groups").exists() or not any(Path("/sys/kernel/iommu_groups").iterdir()):
+        problems.append("no IOMMU groups: enable IOMMU in BIOS and boot with amd_iommu=on (or intel_iommu=on) iommu=pt")
+    gpus = sorted(a_ for a_ in os.listdir(PCI) if pci_class(a_).startswith(("0x0300", "0x0302")) and vendor(a_) == "0x10de")
+    nvswitch = sorted(a_ for a_ in os.listdir(PCI) if pci_class(a_).startswith("0x0680") and vendor(a_) == "0x10de")
+    extra: list[str] = []
+    for g in gpus:
+        for m in group_members(g):
+            if m == g or m in gpus or m in extra or is_bridge(m):
+                continue
+            if vendor(m) != "0x10de":
+                problems.append(f"{m} (class {pci_class(m)}, vendor {vendor(m)}) shares IOMMU group with GPU {g}; it would be passed through too")
+            extra.append(m)
+    nvme: list[str] = []
+    if a.passthrough_nvme:
+        root = root_controller()
+        for ctrl, addr in nvme_controllers().items():
+            if root == ctrl:
+                continue
+            namespaces = [p.name for p in Path(f"/sys/class/nvme/{ctrl}").glob(f"{ctrl}n*")]
+            if any(block_in_use(n) for n in namespaces):
+                print(f"skipping {ctrl} ({addr}): a namespace is mounted or in use", file=sys.stderr)
+                continue
+            nvme.append(addr)
+    cpus = os.cpu_count() or 1
+    mem_gb = 0
+    for line in read(Path("/proc/meminfo")).splitlines():
+        if line.startswith("MemTotal:"):
+            mem_gb = int(line.split()[1]) // (1024 * 1024)
+    vcpus = a.vcpus or max(1, cpus - a.reserve_cpus)
+    memory_gb = a.memory_gb or max(1, mem_gb - a.reserve_mem_gb)
+    data_disk_gb = a.data_disk_gb
+    if data_disk_gb < 0:
+        data_disk_gb = 0
+        if not nvme:
+            free_gb = shutil.disk_usage(a.vm_dir if a.vm_dir.exists() else a.vm_dir.parent if a.vm_dir.parent.exists() else "/").free // 10**9
+            data_disk_gb = 500 if free_gb >= 700 else max(0, free_gb - 200)
+    res = {"gpu_pci": gpus, "nvswitch_pci": nvswitch, "nvme_pci": nvme, "extra_pci": extra, "nic_vf_pci": None, "vcpus": vcpus, "memory_gb": memory_gb,
+           "os_disk_gb": a.os_disk_gb, "data_disk_gb": data_disk_gb, "hugepage_kib": a.hugepage_kib, "pci_mmio64_mb": a.pci_mmio64_mb}
+    if not gpus:
+        problems.append("no NVIDIA GPU found on the PCI bus")
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps(res, indent=1) + "\n")
+    print(json.dumps(res, indent=1))
+    for p in problems:
+        print("PROBLEM: " + p, file=sys.stderr)
+    return 2 if problems else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

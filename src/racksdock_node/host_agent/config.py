@@ -12,10 +12,18 @@ from racksdock_subnet.verifier.config import TrustConfig
 
 @dataclass
 class NetworkConfig:
-    mode: str = "bridge"  # bridge | nat | sriov
+    """How the VM reaches the internet and how tenants reach its SSH port.
+
+    bridge: the VM gets `public_ip` on `bridge` (one public IP per node).
+    nat:    the VM sits on the libvirt NAT network `nat_network`; the host forwards host:`nat_ssh_port` to VM:22 (single-IP hosts,
+            lab boxes). `public_ip` is then the host address tenants connect to (auto-detected from the default route when unset).
+    """
+
+    mode: str = "bridge"  # bridge | nat
     bridge: str = "br0"
     public_ip: str | None = None
-    nat_ssh_port_base: int = 20000
+    nat_network: str = "default"
+    nat_ssh_port: int = 20022
     sriov_vf_pci: str | None = None
 
 
@@ -89,7 +97,8 @@ class HostAgentConfig:
             cfg.resources = VmResources.model_validate(json.loads(Path(rp).read_text()))
         if e("RACKSDOCK_NET_MODE"):
             cfg.network = NetworkConfig(mode=e("RACKSDOCK_NET_MODE", "bridge"), bridge=e("RACKSDOCK_NET_BRIDGE", "br0"),
-                                        public_ip=e("RACKSDOCK_PUBLIC_IP"), sriov_vf_pci=e("RACKSDOCK_SRIOV_VF_PCI"))
+                                        public_ip=e("RACKSDOCK_PUBLIC_IP") or None, nat_network=e("RACKSDOCK_NAT_NETWORK", "default"),
+                                        nat_ssh_port=int(e("RACKSDOCK_NAT_SSH_PORT", "20022")), sriov_vf_pci=e("RACKSDOCK_SRIOV_VF_PCI"))
         if cfg.sim or cfg.static:
             cfg.agent_transport = "tcp"
             if not e("RACKSDOCK_AGENT_PORT"):

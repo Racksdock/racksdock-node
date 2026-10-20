@@ -1,6 +1,9 @@
-# validator image: diagnostics and benchmarks (DCGM, nccl-tests and nvbandwidth are installed by racksdock-image-finalize.sh from NVIDIA repos / source)
-datacenter-gpu-manager
+# validator image: diagnostics and benchmarks. DCGM, the CUDA toolkit, nccl-tests and nvbandwidth are installed by
+# racksdock-image-finalize.sh from the NVIDIA repositories / source (they are not in the Ubuntu archive).
 fio
 iperf3
 sysbench
 memtester
+git
+cmake
+libboost-program-options-dev

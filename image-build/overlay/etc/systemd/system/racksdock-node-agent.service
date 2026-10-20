@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=racksdock-agent
-Group=racksdock-agent
-SupplementaryGroups=video
+# Runs as root inside the tenant's VM: it formats and mounts the encrypted data disk, reads cloud-init's copy of the user-data
+# for the attestation hash and talks to the GPUs. The VM is the tenant's trust domain; the tenant (root) can inspect or stop it
+# (docs/node-agent-privileges.md). It only answers signed, allowlisted challenges relayed by the host.
 Environment=RACKSDOCK_NODE_AGENT_MODE=real
 Environment=RACKSDOCK_AGENT_TRANSPORT=vsock
 Environment=RACKSDOCK_TRUST_MODE=prod
@@ -15,14 +15,9 @@ EnvironmentFile=-/etc/racksdock/node-agent.env
 ExecStart=/usr/local/bin/racksdock-node-agent
 Restart=always
 RestartSec=2
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/racksdock-node-agent /run/racksdock
-DeviceAllow=/dev/nvidiactl rw
-DeviceAllow=/dev/nvidia-uvm rw
-DeviceAllow=char-195 rw
-DeviceAllow=/dev/vsock rw
-PrivateTmp=true
+RuntimeDirectory=racksdock
+RuntimeDirectoryPreserve=yes
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
