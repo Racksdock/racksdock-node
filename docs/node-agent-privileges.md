@@ -1,0 +1,1 @@
+The data-disk and teardown steps need `cryptsetup`, `mount` and `systemctl poweroff`; grant them via a narrowly scoped sudoers entry for `racksdock-agent` (`/etc/sudoers.d/racksdock-agent`) in the image build rather than running the agent as root.

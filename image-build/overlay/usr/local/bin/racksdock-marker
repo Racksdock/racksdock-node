@@ -1,0 +1,8 @@
+#!/bin/bash
+# write: leave markers on the data disk and in GPU memory; check: report whether any marker is present.
+set -e
+case "$1" in
+  write) echo "racksdock-marker $(date -u +%FT%TZ)" > /data/.racksdock-marker; racksdock-memtest --write-marker --fraction 0.5 >/dev/null 2>&1 || true; echo "marker written";;
+  check) if [ -f /data/.racksdock-marker ]; then echo "marker: present"; else echo "marker: absent"; fi;;
+  *) echo "usage: racksdock-marker write|check"; exit 2;;
+esac

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wrapper for the pinned tensor-parallel inference benchmark container. Prints: tokens_per_s, ttft_p50_ms.
+exec docker run --rm --gpus all --ipc=host racksdock/infer-bench:pinned "$@"

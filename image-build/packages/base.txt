@@ -1,0 +1,15 @@
+# every catalog image
+cloud-init
+openssh-server
+docker.io
+ufw
+cryptsetup
+nvme-cli
+pciutils
+python3
+python3-venv
+build-essential
+gcc
+curl
+jq
+chrony

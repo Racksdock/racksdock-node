@@ -1,0 +1,13 @@
+[Unit]
+Description=Bind GPU, NVSwitch and data NVMe PCI functions to vfio-pci
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=libvirtd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bind-vfio.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

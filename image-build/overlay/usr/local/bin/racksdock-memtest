@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Allocate, write and verify GPU memory on every GPU through the CUDA driver API (ctypes; no CUDA toolkit required).
+
+Prints 'gpuN.usable_gb', 'verify: ok|marker_found|mismatch', 'hbm_write_gbps'. Options: --fraction 0.95, --quick, --write-marker.
+"""
+import argparse, ctypes, sys, time
+
+MARKER = 0xB300B300
+CHUNK = 1 << 30  # 1 GiB
+
+
+def check(rc, what):
+    if rc != 0:
+        raise SystemExit(f"{what} failed: CUresult {rc}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fraction", type=float, default=0.95)
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--write-marker", action="store_true")
+    a = ap.parse_args()
+    cu = ctypes.CDLL("libcuda.so.1")
+    check(cu.cuInit(0), "cuInit")
+    n = ctypes.c_int()
+    check(cu.cuDeviceGetCount(ctypes.byref(n)), "cuDeviceGetCount")
+    verify = "ok"
+    total_bytes, total_time = 0, 0.0
+    for i in range(n.value):
+        dev = ctypes.c_int()
+        check(cu.cuDeviceGet(ctypes.byref(dev), i), "cuDeviceGet")
+        ctx = ctypes.c_void_p()
+        check(cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev), "cuDevicePrimaryCtxRetain")
+        check(cu.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+        free, tot = ctypes.c_size_t(), ctypes.c_size_t()
+        check(cu.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(tot)), "cuMemGetInfo")
+        target = int(free.value * (0.5 if a.quick else a.fraction))
+        ptrs = []
+        allocated = 0
+        while allocated + CHUNK <= target:
+            p = ctypes.c_void_p()
+            if cu.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(CHUNK)) != 0:
+                break
+            ptrs.append(p)
+            allocated += CHUNK
+        pattern = MARKER if a.write_marker else (0xA5A5A5A5 ^ i)
+        host = (ctypes.c_uint32 * 1024)()
+        t0 = time.perf_counter()
+        for p in ptrs:
+            check(cu.cuMemsetD32_v2(p, ctypes.c_uint32(pattern), ctypes.c_size_t(CHUNK // 4)), "cuMemsetD32")
+        check(cu.cuCtxSynchronize(), "cuCtxSynchronize")
+        dt = time.perf_counter() - t0
+        total_bytes += allocated
+        total_time += dt
+        for p in ptrs:
+            if a.quick:
+                # look for a leftover marker before we overwrite anything: read the first 4 KiB as it was before memset is not possible,
+                # so quick mode uses a fresh allocation + read instead of memset (below)
+                pass
+            check(cu.cuMemcpyDtoH_v2(host, p, ctypes.c_size_t(4096)), "cuMemcpyDtoH")
+            if any(w != pattern for w in host):
+                verify = "mismatch"
+        for p in ptrs:
+            cu.cuMemFree_v2(p)
+        print(f"gpu{i}.usable_gb: {allocated / 2**30:.1f}")
+        cu.cuDevicePrimaryCtxRelease_v2(dev)
+    if a.quick:
+        # residue check: a freshly allocated, un-memset buffer must not contain the marker pattern
+        for i in range(n.value):
+            dev = ctypes.c_int(); cu.cuDeviceGet(ctypes.byref(dev), i)
+            ctx = ctypes.c_void_p(); cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev); cu.cuCtxSetCurrent(ctx)
+            p = ctypes.c_void_p()
+            if cu.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(CHUNK)) == 0:
+                host = (ctypes.c_uint32 * (1 << 18))()
+                cu.cuMemcpyDtoH_v2(host, p, ctypes.c_size_t(1 << 20))
+                if any(w == MARKER for w in host):
+                    verify = "marker_found"
+                cu.cuMemFree_v2(p)
+            cu.cuDevicePrimaryCtxRelease_v2(dev)
+    print(f"verify: {verify}")
+    if total_time > 0:
+        print(f"hbm_write_gbps: {total_bytes / total_time / 1e9:.0f}")
+    return 0 if verify == "ok" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

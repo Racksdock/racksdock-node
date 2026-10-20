@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Allocate a fraction of RAM in 256 MiB chunks, write a pattern, verify. Prints allocated_gb and verify."""
+import argparse, sys
+
+ap = argparse.ArgumentParser(); ap.add_argument("--fraction", type=float, default=0.9); a = ap.parse_args()
+total_kb = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
+target = int(total_kb * 1024 * a.fraction)
+chunk = 256 * 2**20
+pattern = bytes([0xA5, 0x5A, 0xB3, 0x00]) * (chunk // 4)
+chunks = []
+ok = True
+try:
+    while sum(len(c) for c in chunks) + chunk <= target:
+        b = bytearray(pattern)
+        chunks.append(b)
+    for b in chunks:
+        if b[:4096] != pattern[:4096] or b[-4096:] != pattern[-4096:]:
+            ok = False
+except MemoryError:
+    pass
+print(f"allocated_gb: {sum(len(c) for c in chunks) / 2**30:.0f}")
+print(f"verify: {'ok' if ok else 'mismatch'}")
+sys.exit(0 if ok else 1)

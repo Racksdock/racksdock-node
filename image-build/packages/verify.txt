@@ -1,0 +1,6 @@
+# validator image: diagnostics and benchmarks (DCGM, nccl-tests and nvbandwidth are installed by racksdock-image-finalize.sh from NVIDIA repos / source)
+datacenter-gpu-manager
+fio
+iperf3
+sysbench
+memtester

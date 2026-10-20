@@ -1,0 +1,28 @@
+[Unit]
+Description=racksdock node agent (attestation, status, allowlisted health)
+After=network-online.target cloud-init.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=racksdock-agent
+Group=racksdock-agent
+SupplementaryGroups=video
+Environment=RACKSDOCK_NODE_AGENT_MODE=real
+Environment=RACKSDOCK_AGENT_TRANSPORT=vsock
+Environment=RACKSDOCK_TRUST_MODE=prod
+EnvironmentFile=-/etc/racksdock/node-agent.env
+ExecStart=/usr/local/bin/racksdock-node-agent
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/racksdock-node-agent /run/racksdock
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=char-195 rw
+DeviceAllow=/dev/vsock rw
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

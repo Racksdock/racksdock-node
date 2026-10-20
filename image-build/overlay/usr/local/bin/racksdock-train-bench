@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wrapper for the pinned 8-GPU training benchmark container. Prints: tokens_per_s, step_time_p50_ms, step_time_p95_ms, loss_final.
+exec docker run --rm --gpus all --ipc=host racksdock/train-bench:pinned "$@"

@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Run the tenant's launch configuration from /etc/racksdock/launch.json once; record status in /run/racksdock/launch.status."""
+import base64, json, os, shlex, subprocess, sys
+from pathlib import Path
+
+CFG = Path("/etc/racksdock/launch.json"); STATUS = Path("/run/racksdock/launch.status")
+
+
+def status(s: str) -> None:
+    STATUS.parent.mkdir(parents=True, exist_ok=True)
+    STATUS.write_text(s + "\n")
+
+
+def main() -> int:
+    if not CFG.exists():
+        status("none"); return 0
+    cfg = json.loads(CFG.read_text())
+    status("starting")
+    if cfg.get("type") == "script":
+        script = base64.b64decode(cfg["script"]["base64_script"])
+        p = Path("/etc/racksdock/startup.sh"); p.write_bytes(script); p.chmod(0o700)
+        rc = subprocess.call(["/bin/bash", str(p)], env={**os.environ, "HOME": "/root"})
+        status(f"exited:{rc}"); return 0
+    if cfg.get("type") == "docker":
+        d = cfg["docker"]
+        cmd = ["docker", "run", "-d", "--name", "racksdock-launch", "--restart", "unless-stopped", "--gpus", "all", "--ipc=host"]
+        for e in d.get("envs", []):
+            cmd += ["-e", f"{e['name']}={e['value']}"]
+        for pm in d.get("port_mappings", []):
+            cmd += ["-p", f"{pm['host_port']}:{pm['container_port']}"]
+        for vm in d.get("volume_mounts", []):
+            cmd += ["-v", f"{vm['host_path']}:{vm['container_path']}"]
+        if d.get("shared_memory_in_gb"):
+            cmd += ["--shm-size", f"{d['shared_memory_in_gb']}g"]
+        rc_ = d.get("registry_credentials") or {}
+        if rc_.get("username") and rc_.get("password"):
+            subprocess.call(["docker", "login", "-u", rc_["username"], "--password-stdin", d["image"].split("/")[0] if "." in d["image"].split("/")[0] else ""], input=rc_["password"].encode())
+        cmd.append(d["image"])
+        if d.get("args"):
+            cmd += shlex.split(d["args"])
+        rc = subprocess.call(cmd)
+        status("started" if rc == 0 else f"failed:{rc}"); return 0
+    status("unknown_type"); return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

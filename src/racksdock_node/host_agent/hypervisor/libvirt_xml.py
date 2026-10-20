@@ -1,0 +1,107 @@
+"""libvirt domain XML for the whole-node VM (docs/01 §4). Pure function, unit-tested without libvirt."""
+from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from racksdock_subnet.core.schemas import VmResources
+
+OVMF_CODE = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+OVMF_VARS = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+
+
+def parse_pci(addr: str) -> tuple[str, str, str, str]:
+    """'0000:17:00.0' -> ('0x0000','0x17','0x00','0x0')"""
+    dom, bus, rest = addr.split(":")
+    slot, func = rest.split(".")
+    return f"0x{dom}", f"0x{bus}", f"0x{slot}", f"0x{int(func, 16):x}"
+
+
+def numa_plan(vcpus: int, host_cores: list[list[int]] | None) -> list[tuple[int, int]]:
+    """Return [(vcpu, host_cpu)] pinning. host_cores: per-NUMA-node list of host CPU ids available to the VM."""
+    if not host_cores:
+        return []
+    flat: list[int] = []
+    # interleave nodes so each NUMA node gets an equal share of vcpus
+    per_node = [list(c) for c in host_cores]
+    while any(per_node) and len(flat) < vcpus:
+        for n in per_node:
+            if n and len(flat) < vcpus:
+                flat.append(n.pop(0))
+    return [(i, c) for i, c in enumerate(flat)]
+
+
+def build_domain_xml(name: str, resources: VmResources, os_disk: Path, seed_iso: Path, nvram: Path,
+                     host_cores: list[list[int]] | None = None, bridge: str | None = "br0", vsock_cid: int | None = None,
+                     hugepage_kib: int = 1048576) -> str:
+    dom = ET.Element("domain", type="kvm")
+    ET.SubElement(dom, "name").text = name
+    ET.SubElement(dom, "memory", unit="GiB").text = str(resources.memory_gb)
+    ET.SubElement(dom, "currentMemory", unit="GiB").text = str(resources.memory_gb)
+    mb = ET.SubElement(dom, "memoryBacking")
+    hp = ET.SubElement(mb, "hugepages")
+    ET.SubElement(hp, "page", size=str(hugepage_kib), unit="KiB")
+    ET.SubElement(mb, "locked")
+    ET.SubElement(mb, "nosharepages")
+    ET.SubElement(dom, "vcpu", placement="static").text = str(resources.vcpus)
+    pins = numa_plan(resources.vcpus, host_cores)
+    if pins:
+        ct = ET.SubElement(dom, "cputune")
+        for v, c in pins:
+            ET.SubElement(ct, "vcpupin", vcpu=str(v), cpuset=str(c))
+    os_el = ET.SubElement(dom, "os")
+    ET.SubElement(os_el, "type", arch="x86_64", machine="q35").text = "hvm"
+    ET.SubElement(os_el, "loader", readonly="yes", type="pflash").text = OVMF_CODE
+    ET.SubElement(os_el, "nvram", template=OVMF_VARS).text = str(nvram)
+    feats = ET.SubElement(dom, "features")
+    ET.SubElement(feats, "acpi")
+    ET.SubElement(feats, "apic")
+    cpu = ET.SubElement(dom, "cpu", mode="host-passthrough", check="none", migratable="off")
+    ET.SubElement(cpu, "cache", mode="passthrough")
+    if host_cores and len(host_cores) > 1 and pins:
+        numa = ET.SubElement(cpu, "numa")
+        per = resources.vcpus // len(host_cores)
+        mem_per = resources.memory_gb // len(host_cores)
+        for i in range(len(host_cores)):
+            lo = i * per
+            hi = resources.vcpus - 1 if i == len(host_cores) - 1 else lo + per - 1
+            ET.SubElement(numa, "cell", id=str(i), cpus=f"{lo}-{hi}", memory=str(mem_per), unit="GiB")
+    ET.SubElement(dom, "on_poweroff").text = "destroy"
+    ET.SubElement(dom, "on_reboot").text = "restart"
+    ET.SubElement(dom, "on_crash").text = "destroy"
+    dev = ET.SubElement(dom, "devices")
+    ET.SubElement(dev, "emulator").text = "/usr/bin/qemu-system-x86_64"
+    d = ET.SubElement(dev, "disk", type="file", device="disk")
+    ET.SubElement(d, "driver", name="qemu", type="qcow2", cache="none", io="native", discard="unmap")
+    ET.SubElement(d, "source", file=str(os_disk))
+    ET.SubElement(d, "target", dev="vda", bus="virtio")
+    ET.SubElement(d, "boot", order="1")
+    cd = ET.SubElement(dev, "disk", type="file", device="cdrom")
+    ET.SubElement(cd, "driver", name="qemu", type="raw")
+    ET.SubElement(cd, "source", file=str(seed_iso))
+    ET.SubElement(cd, "target", dev="sda", bus="sata")
+    ET.SubElement(cd, "readonly")
+    for addr in list(resources.gpu_pci) + list(resources.nvswitch_pci) + list(resources.nvme_pci) + ([resources.nic_vf_pci] if resources.nic_vf_pci else []):
+        hd = ET.SubElement(dev, "hostdev", mode="subsystem", type="pci", managed="yes")
+        src = ET.SubElement(hd, "source")
+        dmn, bus, slot, func = parse_pci(addr)
+        ET.SubElement(src, "address", domain=dmn, bus=bus, slot=slot, function=func)
+    if not resources.nic_vf_pci and bridge:
+        iface = ET.SubElement(dev, "interface", type="bridge")
+        ET.SubElement(iface, "source", bridge=bridge)
+        ET.SubElement(iface, "model", type="virtio")
+    vs = ET.SubElement(dev, "vsock", model="virtio")
+    if vsock_cid:
+        ET.SubElement(vs, "cid", auto="no", address=str(vsock_cid))
+    else:
+        ET.SubElement(vs, "cid", auto="yes")
+    rng = ET.SubElement(dev, "rng", model="virtio")
+    ET.SubElement(rng, "backend", model="random").text = "/dev/urandom"
+    ser = ET.SubElement(dev, "serial", type="pty")
+    ET.SubElement(ser, "target", port="0")
+    con = ET.SubElement(dev, "console", type="pty")
+    ET.SubElement(con, "target", type="serial", port="0")
+    ET.SubElement(dev, "video").append(ET.Element("model", type="none"))
+    ET.SubElement(dev, "memballoon", model="none")
+    ET.indent(dom)
+    return ET.tostring(dom, encoding="unicode")

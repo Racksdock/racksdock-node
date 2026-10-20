@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""STREAM-like memory bandwidth fallback (pure Python, NumPy if available). Prints the same 'Triad:' line format as STREAM."""
+import time
+
+N = 64 * 1024 * 1024  # 64 MiB arrays
+try:
+    import numpy as np
+
+    a = np.ones(N // 8, dtype=np.float64); b = np.ones(N // 8, dtype=np.float64) * 2; c = np.empty_like(a)
+    def copy(): c[:] = a
+    def scale(): c[:] = 3.0 * a
+    def add(): c[:] = a + b
+    def triad(): c[:] = a + 3.0 * b
+    byte = {"Copy": 2 * N, "Scale": 2 * N, "Add": 3 * N, "Triad": 3 * N}
+except ImportError:
+    src = bytearray(N); dst = bytearray(N); ms, md = memoryview(src), memoryview(dst)
+    def copy(): md[:] = ms
+    scale = add = triad = copy
+    byte = {"Copy": 2 * N, "Scale": 2 * N, "Add": 2 * N, "Triad": 2 * N}
+print("Function    Best Rate MB/s  Avg time     Min time     Max time")
+for name, fn in (("Copy", copy), ("Scale", scale), ("Add", add), ("Triad", triad)):
+    best = 0.0
+    for _ in range(10):
+        t0 = time.perf_counter(); fn(); dt = time.perf_counter() - t0
+        best = max(best, byte[name] / dt / 1e6)
+    print(f"{name}:{best:>18.1f}     0.0  0.0  0.0")

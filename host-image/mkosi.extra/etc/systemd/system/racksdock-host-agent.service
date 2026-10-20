@@ -1,0 +1,15 @@
+[Unit]
+Description=racksdock host agent (VM lifecycle, relay, recovery)
+After=network-online.target libvirtd.service racksdock-bind-vfio.service
+Wants=network-online.target
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/racksdock/host-agent.env
+ExecStart=/opt/racksdock/venv/bin/racksdock-host-agent
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

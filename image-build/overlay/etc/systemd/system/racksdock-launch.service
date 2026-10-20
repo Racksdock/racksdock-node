@@ -1,0 +1,12 @@
+[Unit]
+Description=racksdock tenant launch configuration (startup script or Docker container)
+After=cloud-final.service docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/racksdock-launch
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
