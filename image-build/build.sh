@@ -19,8 +19,11 @@ esac
 BASE="$CACHE/$(basename "$BASE_URL")"
 [ -f "$BASE" ] || curl -fsSL -o "$BASE" "$BASE_URL"
 IMG="$OUT/${OS}_${RELEASE}.qcow2"
-rm -f "$IMG"
-qemu-img create -q -f qcow2 -b "$BASE" -F qcow2 "$IMG" 200G
+rm -f "$IMG" "$IMG.tmp"
+# The cloud image's root filesystem is ~2 GB. Enlarging the qcow2 alone does not grow the partition or the filesystem (the
+# install would run out of space), so virt-resize copies the image into a fresh ${IMAGE_SIZE} disk and expands the root partition.
+qemu-img create -q -f qcow2 "$IMG" "${IMAGE_SIZE:-200G}"
+virt-resize --format qcow2 --output-format qcow2 --expand /dev/sda1 "$BASE" "$IMG"
 PKGS="$(grep -v '^#' "$HERE/packages/base.txt" | grep . | tr '\n' ',' | sed 's/,$//')"
 [ -f "$HERE/packages/$OS.txt" ] && EXTRA="$(grep -v '^#' "$HERE/packages/$OS.txt" | grep . | tr '\n' ',' | sed 's/,$//')" && [ -n "$EXTRA" ] && PKGS="$PKGS,$EXTRA"
 # The node-agent and its dependencies are fetched on the build host FOR THE GUEST's Python, so the image never needs PyPI.
@@ -38,9 +41,7 @@ virt-customize -a "$IMG" --smp "${BUILD_CPUS:-8}" --memsize "${BUILD_MEM_MB:-819
   --write "/etc/racksdock/image-version:${OS}_${RELEASE}" \
   --selinux-relabel
 if [ -z "${NO_COMPRESS:-}" ]; then
-  qemu-img convert -O qcow2 -c "$IMG" "$IMG.tmp" && mv "$IMG.tmp" "$IMG"
-else
-  qemu-img convert -O qcow2 "$IMG" "$IMG.tmp" && mv "$IMG.tmp" "$IMG"   # flatten the backing chain
+  qemu-img convert -O qcow2 -c "$IMG" "$IMG.tmp" && mv "$IMG.tmp" "$IMG"   # NO_COMPRESS=1 skips this (faster, larger file)
 fi
 sha256sum "$IMG" > "$IMG.sha256"
 echo "built $IMG"
