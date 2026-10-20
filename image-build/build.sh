@@ -35,7 +35,7 @@ NODE_WHL="$(ls "$WHEELS"/racksdock_node-*.whl)"
   --find-links "$WHEELS" -d "$WHEELS" "racksdock-node[nvml] @ file://$NODE_WHL"
 virt-customize -a "$IMG" --smp "${BUILD_CPUS:-8}" --memsize "${BUILD_MEM_MB:-8192}" \
   --install "$PKGS" \
-  --copy-in "$HERE/overlay/usr:/" --copy-in "$HERE/overlay/etc:/" --copy-in "$WHEELS:/opt/racksdock/" \
+  --mkdir /opt/racksdock --copy-in "$HERE/overlay/usr:/" --copy-in "$HERE/overlay/etc:/" --copy-in "$WHEELS:/opt/racksdock/" \
   --run-command "bash /usr/local/bin/racksdock-image-finalize.sh '$OS' '$RELEASE' '$DRIVER' '$CUDA'" \
   --run-command "PYBIN=\$(command -v python$GUEST_PY || command -v python3); \$PYBIN -m venv /opt/racksdock/venv && /opt/racksdock/venv/bin/pip install -q --no-index --find-links /opt/racksdock/wheels-$GUEST_PY 'racksdock-node[nvml]' && ln -sf /opt/racksdock/venv/bin/racksdock-node-agent /usr/local/bin/racksdock-node-agent && rm -rf /opt/racksdock/wheels-$GUEST_PY" \
   --write "/etc/racksdock/image-version:${OS}_${RELEASE}" \
