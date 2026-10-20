@@ -82,6 +82,9 @@ class HostAgent:
         if not t.dev or t.dev_ca_dir is None or self.cfg.sim_node_dir is None:
             return {}
         files = {"/etc/racksdock/node-agent.env": "RACKSDOCK_TRUST_MODE=dev\nRACKSDOCK_DEV_CA_DIR=/etc/racksdock/devca\nRACKSDOCK_SIM_NODE_DIR=/etc/racksdock/node\n"}
+        if self.cfg.dev_ssh_pubkey:
+            # operator access to every VM for debugging the real path on a lab box; cloud-init adds it to the default user
+            files["__ssh_authorized_keys__"] = self.cfg.dev_ssh_pubkey.strip() + "\n"
         for src, dst in ((Path(t.dev_ca_dir), "/etc/racksdock/devca"), (Path(self.cfg.sim_node_dir), "/etc/racksdock/node")):
             if not src.exists():
                 raise RuntimeError(f"dev trust mode: {src} missing (racksdock-verify devca fetch / fetch-node)")
@@ -311,8 +314,11 @@ class HostAgent:
     # ---- node-agent messages -------------------------------------------------
     async def _on_agent_message(self, msg: AgentMessage) -> None:
         if self.current is None:
+            log.warning("node-agent message %s with no VM registered; ignored", msg.type)
             return
         iid = self.current.instance_id
+        if msg.type not in ("status", "log"):
+            log.info("node-agent %s for %s", msg.type, iid)
         if msg.type == "hello":
             lc = self.current_launch
             if lc is None:
@@ -342,4 +348,5 @@ class HostAgent:
         elif msg.type == "teardown_ack":
             self._teardown_ack.set()
         elif msg.type == "log":
-            log.debug("node-agent: %s", msg.payload)
+            lvl = logging.WARNING if msg.payload.get("level") in ("warning", "error") else logging.INFO
+            log.log(lvl, "node-agent %s: %s", iid, msg.payload.get("msg"))

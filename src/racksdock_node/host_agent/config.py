@@ -56,6 +56,7 @@ class HostAgentConfig:
     static_authorized_keys: Path = Path("/home/ubuntu/.ssh/authorized_keys")
     static_ssh_service: str | None = "ssh"  # restarted on "reboot" of a static node; None disables (tests)
     trust: TrustConfig = field(default_factory=TrustConfig.from_env)
+    dev_ssh_pubkey: str | None = None  # dev trust mode only: operator SSH public key added to every VM (RACKSDOCK_DEV_SSH_PUBKEY, file or line)
 
     @property
     def sim(self) -> bool:
@@ -107,4 +108,7 @@ class HostAgentConfig:
         cfg.static_ssh_port = int(e("RACKSDOCK_STATIC_SSH_PORT", "22"))
         cfg.static_authorized_keys = Path(e("RACKSDOCK_STATIC_AUTHORIZED_KEYS", "/home/ubuntu/.ssh/authorized_keys"))
         cfg.static_ssh_service = e("RACKSDOCK_STATIC_SSH_SERVICE", "ssh") or None
+        k = e("RACKSDOCK_DEV_SSH_PUBKEY")
+        if k and cfg.trust.dev:
+            cfg.dev_ssh_pubkey = Path(k).read_text() if Path(k).exists() else k
         return cfg

@@ -126,6 +126,11 @@ could read VM memory; no CC in this design.
 | image build: `supermin: failed to find a suitable kernel` | build-images.sh | `chmod 0644 /boot/vmlinuz-*` (the script does this; rerun) |
 | image build: driver package not found | build-images.sh | pass `DRIVER=<version listed by apt-cache search nvidia-driver- | grep server-open>` |
 
+Inside a VM: in dev trust mode the host-agent adds the key named by `RACKSDOCK_DEV_SSH_PUBKEY` (set by `setup-host.sh` to the
+key you use for the box) to every VM, so `ssh -p 20022 ubuntu@172.19.4.67` works for the bootstrap and verify VMs too. There:
+`sudo journalctl -u racksdock-node-agent -b --no-pager`, `cloud-init status --long`, `ls -R /etc/racksdock`, `lsmod | grep vsock`,
+`nvidia-smi`. The VM's boot console is kept at `/var/lib/racksdock/vms/<instance>/console.log` on the host.
+
 Logs: `/var/lib/racksdock-vmtest/logs/`. Reset between runs: `virsh destroy <name>; virsh undefine --nvram <name>` (the next
 host-agent start does this itself), `rm -rf /var/lib/racksdock-vmtest`.
 

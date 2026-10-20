@@ -25,7 +25,7 @@ from .libvirt_xml import OVMF_CODE, OVMF_VARS, build_domain_xml, passthrough_add
 
 log = logging.getLogger("racksdock.host-agent.libvirt")
 NAT_TAG = "racksdock-nat"
-VM_FILES = ("os.qcow2", "data.qcow2", "seed.iso", "nvram.fd", "domain.xml")
+VM_FILES = ("os.qcow2", "data.qcow2", "seed.iso", "nvram.fd", "domain.xml")  # console.log is kept for diagnostics
 
 
 async def _run(*cmd: str, check: bool = True, timeout: float = 120) -> subprocess.CompletedProcess:
@@ -157,7 +157,7 @@ class LibvirtBackend:
         net_cfg = None if self.nat else network_config(spec.public_ip, self.gateway)
         build_seed_iso(seed, spec.user_data, spec.metadata, spec.hostname, net_cfg, extra_files=self.guest_files or None)
         xml = build_domain_xml(name, spec.resources, overlay, seed, nvram, self.host_cores, bridge=None if self.nat else self.bridge,
-                               nat_network=self.nat_network if self.nat else None, data_disk=data_disk)
+                               nat_network=self.nat_network if self.nat else None, data_disk=data_disk, console_log=spec.vm_dir / "console.log")
         (spec.vm_dir / "domain.xml").write_text(xml)
         log.info("defining %s: %d vcpus, %d GiB, %d PCI functions, net=%s", name, spec.resources.vcpus, spec.resources.memory_gb,
                  len(passthrough_addresses(spec.resources)), self.net_mode)

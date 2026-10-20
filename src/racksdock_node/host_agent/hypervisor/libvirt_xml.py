@@ -36,7 +36,8 @@ def numa_plan(vcpus: int, host_cores: list[list[int]] | None) -> list[tuple[int,
 
 def build_domain_xml(name: str, resources: VmResources, os_disk: Path, seed_iso: Path, nvram: Path,
                      host_cores: list[list[int]] | None = None, bridge: str | None = "br0", vsock_cid: int | None = None,
-                     hugepage_kib: int | None = None, nat_network: str | None = None, data_disk: Path | None = None) -> str:
+                     hugepage_kib: int | None = None, nat_network: str | None = None, data_disk: Path | None = None,
+                     console_log: Path | None = None) -> str:
     """`bridge` attaches a bridged NIC (one public IP per VM); `nat_network` attaches a libvirt NAT network instead (single-IP
     hosts; the backend forwards a host port). A passed-through NIC VF replaces both. `hugepage_kib` defaults to the profile's
     resources setting; 0 disables hugepage backing."""
@@ -118,6 +119,8 @@ def build_domain_xml(name: str, resources: VmResources, os_disk: Path, seed_iso:
     ET.SubElement(rng, "backend", model="random").text = "/dev/urandom"
     ser = ET.SubElement(dev, "serial", type="pty")
     ET.SubElement(ser, "target", port="0")
+    if console_log is not None:
+        ET.SubElement(ser, "log", file=str(console_log), append="off")  # boot output survives for diagnostics (virtlogd)
     con = ET.SubElement(dev, "console", type="pty")
     ET.SubElement(con, "target", type="serial", port="0")
     ET.SubElement(dev, "video").append(ET.Element("model", type="none"))

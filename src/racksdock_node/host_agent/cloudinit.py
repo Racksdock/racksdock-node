@@ -17,9 +17,13 @@ def vendor_data(meta: Metadata, extra_files: dict[str, str] | None = None) -> st
         {"path": "/etc/racksdock/metadata.json", "permissions": "0644", "content": json.dumps(meta.model_dump(exclude={"user_data"}), sort_keys=True) + "\n"},
         {"path": "/etc/racksdock/image-version", "permissions": "0644", "content": meta.image_version + "\n"},
     ]
+    cfg: dict = {"write_files": files}
     for path, content in sorted((extra_files or {}).items()):
+        if path == "__ssh_authorized_keys__":
+            cfg["ssh_authorized_keys"] = [line for line in content.splitlines() if line.strip()]
+            continue
         files.append({"path": path, "permissions": "0600", "owner": "root:root", "content": content})
-    return "#cloud-config\n" + yaml.safe_dump({"write_files": files}, sort_keys=True)
+    return "#cloud-config\n" + yaml.safe_dump(cfg, sort_keys=True)
 
 
 def meta_data(instance_id: str, hostname: str) -> str:

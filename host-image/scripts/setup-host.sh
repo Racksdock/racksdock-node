@@ -35,7 +35,7 @@ step() { echo; echo "== $*"; }
 
 step "1. packages (KVM, libvirt, OVMF, libguestfs for image builds, iptables, NVMe/PCI tools)"
 apt-get update -q
-apt-get install -y -q qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients ovmf libguestfs-tools iptables pciutils nvme-cli jq curl chrony python3 python3-venv
+apt-get install -y -q qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients ovmf libguestfs-tools iptables pciutils nvme-cli jq curl chrony iperf3 python3 python3-venv
 . /etc/os-release
 PY="${PYTHON:-}"
 if [ -z "$PY" ]; then
@@ -125,6 +125,10 @@ if [ "$TRUST_MODE" = dev ]; then
     RACKSDOCK_PROFILE=$PROFILE $V devca issue-node /etc/racksdock/devca /etc/racksdock/node --count "$COUNT" --pci-id "$PCI_ID" --memory-mib "$MEM_MIB"
   fi
   TRUST_ENV=$'RACKSDOCK_TRUST_MODE=dev\nRACKSDOCK_DEV_CA_DIR=/etc/racksdock/devca\nRACKSDOCK_SIM_NODE_DIR=/etc/racksdock/node'
+  # operator SSH key for every VM (debugging only; the key you use to reach this box, unless DEV_SSH_PUBKEY names another file)
+  for k in "${DEV_SSH_PUBKEY:-}" /root/.ssh/id_ed25519.pub /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys; do
+    [ -n "$k" ] && [ -s "$k" ] && { TRUST_ENV="$TRUST_ENV"$'\n'"RACKSDOCK_DEV_SSH_PUBKEY=$k"; break; }
+  done
 else
   TRUST_ENV="RACKSDOCK_TRUST_MODE=prod"
 fi
