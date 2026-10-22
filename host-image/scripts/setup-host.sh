@@ -185,7 +185,7 @@ step "8. racksdock software -> /opt/racksdock/venv"
 /opt/racksdock/venv/bin/pip install -q --upgrade pip
 # a miner's server needs racksdock-subnet (schemas, verifier, miner neuron) and racksdock-node (host-agent); racksdock-platform
 # (marketplace + tenant CLI) is the owner's software and is installed only when present, for single-box tests
-PKGS=(-e "$REPOS/racksdock-subnet[validator]" -e "$REPOS/racksdock-node[nvml]")
+PKGS=(-e "$REPOS/racksdock-subnet[validator,chain]" -e "$REPOS/racksdock-node[nvml]")  # chain: racksdock-miner bootstrap can run here when the hotkey lives on this server
 [ -d "$REPOS/racksdock-platform" ] && PKGS+=(-e "$REPOS/racksdock-platform")
 /opt/racksdock/venv/bin/pip install -q "${PKGS[@]}"
 mkdir -p /var/lib/racksdock/images /var/lib/racksdock/vms /var/lib/racksdock-host-agent
