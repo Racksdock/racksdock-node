@@ -171,6 +171,11 @@ if grep -q '^nvidia' /proc/modules; then
 fi
 fi
 
+step "5b. IP forwarding (every tier forwards the public address to the rental; some provider images pin it off)"
+printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/99-racksdock-forward.conf
+sysctl -q -w net.ipv4.ip_forward=1
+[ "$(sysctl -n net.ipv4.ip_forward)" = 1 ] || { echo "ERROR: could not enable net.ipv4.ip_forward (check /etc/sysctl.d for an override)"; exit 1; }
+
 step "6. discover VM resources -> /etc/racksdock/resources.json"
 install -m 755 "$HERE/../mkosi.extra/usr/local/bin/racksdock-discover-resources" /usr/local/bin/racksdock-discover-resources
 DISC=(--reserve-cpus "${RESERVE_CPUS:-8}" --reserve-mem-gb "${RESERVE_MEM_GB:-64}" --hugepage-kib "${HUGEPAGE_KIB:-0}" --deployment "$DEPLOYMENT")
