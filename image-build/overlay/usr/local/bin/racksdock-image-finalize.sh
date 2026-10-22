@@ -78,7 +78,9 @@ curl -fsSL -o /tmp/stream.c https://www.cs.virginia.edu/stream/FTP/Code/stream.c
 
 if [ "$OS" = "verify" ]; then
   # DCGM: package names changed across releases (not available for GeForce-only test boxes either); Q4 is skipped when absent
-  apt-get install -y -q datacenter-gpu-manager-4-cuda13 || apt-get install -y -q datacenter-gpu-manager-4-cuda12 \
+  # cuda-all ships the diag plugins for every CUDA line: DCGM picks the plugin set matching the HOST driver, so a cuda13-only
+  # install fails with "Cannot load plugins ... plugins/cuda12" on hosts still running a CUDA 12 driver
+  apt-get install -y -q datacenter-gpu-manager-4-cuda-all || apt-get install -y -q datacenter-gpu-manager-4-cuda13 || apt-get install -y -q datacenter-gpu-manager-4-cuda12 \
     || apt-get install -y -q datacenter-gpu-manager || echo "WARNING: DCGM not installed; Q4 cannot run on this image"
   systemctl enable nvidia-dcgm 2>/dev/null || true
   VCUDA="${CUDA:-13.0}"

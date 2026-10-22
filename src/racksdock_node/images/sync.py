@@ -126,7 +126,9 @@ def sync_catalog(catalog_url: str, image_dir: Path, kinds: tuple[str, ...] = ("v
     m, signed, pub = fetch_manifest(catalog_url, pin)
     image_dir.mkdir(parents=True, exist_ok=True)
     fetched, present, skipped = [], [], []
-    for e in m.images:
+    # the validators' verify image first: it is what the bootstrap and every verification session need, so a host becomes
+    # testable as early as possible while the tenant templates are still downloading
+    for e in sorted(m.images, key=lambda x: (not x.validator_only, x.os)):
         if e.kind not in kinds:
             skipped.append(e.version)
             continue

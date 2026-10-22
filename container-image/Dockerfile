@@ -19,7 +19,7 @@ RUN if [ "$OS" = "verify" ]; then \
           (curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/x86_64/cuda-keyring_1.1-1_all.deb" -o /tmp/cuda-keyring.deb && dpkg -i /tmp/cuda-keyring.deb)) \
       && apt-get update -q \
       && apt-get install -y -q --no-install-recommends --allow-change-held-packages fio iperf3 sysbench memtester git cmake libboost-program-options-dev libnccl2 libnccl-dev \
-      && (apt-get install -y -q datacenter-gpu-manager-4-cuda13 || apt-get install -y -q datacenter-gpu-manager-4-cuda12 || echo "WARNING: no DCGM") \
+      && (apt-get install -y -q datacenter-gpu-manager-4-cuda-all || apt-get install -y -q datacenter-gpu-manager-4-cuda13 || apt-get install -y -q datacenter-gpu-manager-4-cuda12 || echo "WARNING: no DCGM") \
       && git clone --depth 1 https://github.com/NVIDIA/nccl-tests /tmp/nccl-tests && make -C /tmp/nccl-tests -j"$(nproc)" CUDA_HOME=/usr/local/cuda \
       && cp /tmp/nccl-tests/build/*_perf /usr/local/bin/ \
       && git clone --depth 1 https://github.com/NVIDIA/nvbandwidth /tmp/nvbandwidth && cd /tmp/nvbandwidth && cmake -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc . \

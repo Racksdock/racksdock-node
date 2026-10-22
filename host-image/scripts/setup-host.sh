@@ -246,14 +246,16 @@ fi
 systemctl daemon-reload
 cat /etc/racksdock/host-agent.env
 echo
-echo "Host ready. Next:"
+# the host-agent fetches the platform's signed image catalog by itself (docs/01 §6.1): no image build on the host
 if [ "$DEPLOYMENT" = container ]; then
-echo "  build + sign the container images: bash $REPOS/racksdock-platform/dev/vmtest/build-container-images.sh verify ubuntu24.04"
-elif [ "$DEPLOYMENT" = dual ]; then
-echo "  VM images (if not built yet):      bash $REPOS/racksdock-platform/dev/vmtest/build-images.sh verify ubuntu24.04"
-echo "  container images + one manifest:   bash $REPOS/racksdock-platform/dev/vmtest/build-container-images.sh verify ubuntu24.04"
+  systemctl enable --now racksdock-host-agent >/dev/null 2>&1 || true
+  echo "Host ready: racksdock-host-agent is running and syncing the image catalog from $PLATFORM_URL (journalctl -fu racksdock-host-agent)."
 else
-echo "  build + sign the catalog images:  bash $REPOS/racksdock-platform/dev/vmtest/build-images.sh verify ubuntu24.04"
+  systemctl enable racksdock-host-agent >/dev/null 2>&1 || true
+  echo "Host ready: reboot now (IOMMU/hugepages); racksdock-host-agent starts at boot and syncs the image catalog from $PLATFORM_URL."
 fi
-echo "  single-box workflow test:          /opt/racksdock/venv/bin/python $REPOS/racksdock-platform/dev/vmtest/run_vm_test.py"
-echo "  or run the host-agent as a service: systemctl enable --now racksdock-host-agent   (journalctl -fu racksdock-host-agent)"
+echo "Next, on the machine holding the miner wallet:"
+echo "  host key:   (on this host) set -a; . /etc/racksdock/host-agent.env; set +a; /opt/racksdock/venv/bin/racksdock-host-agent --show-key"
+echo "  bootstrap:  RACKSDOCK_PLATFORM_URL=$PLATFORM_URL RACKSDOCK_HOTKEY=$MINER_HOTKEY RACKSDOCK_CHAIN=subtensor RACKSDOCK_CHAIN_NETWORK=<net> RACKSDOCK_NETUID=<netuid> \\"
+echo "              RACKSDOCK_WALLET_NAME=<coldkey> RACKSDOCK_WALLET_HOTKEY=<hotkey> racksdock-miner bootstrap --host-pubkey <host key>"
+echo "  (single-box lab test instead: /opt/racksdock/venv/bin/python $REPOS/racksdock-platform/dev/vmtest/run_vm_test.py)"

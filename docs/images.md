@@ -34,3 +34,14 @@ CUDA devel image. The host's NVIDIA driver is injected at run time by the contai
 in-image tools (`racksdock-memtest`, `racksdock-launch`, ...) are copied from `image-build/overlay`. `racksdock-images manifest build
 <dir> <release> --containers` adds entries of kind `container` pinned to the docker image id; the host-agent refuses an image whose
 id differs. `dev/vmtest/build-container-images.sh verify ubuntu24.04` does build, manifest, sign and catalog in one go.
+
+DCGM in the `verify` images is `datacenter-gpu-manager-4-cuda-all`: DCGM loads the diag plugin set matching the **host's** driver
+(`plugins/cuda12` on a CUDA 12 driver, `cuda13` on CUDA 13), so an image with only the `-cuda13` package aborts `dcgmi diag` with
+"Cannot load plugins ... plugins/cuda12" on hosts that still run a CUDA 12 driver (seen on a third-party A100 VM, release v2026.10.1).
+
+### Patch releases
+
+`racksdock-platform/dev/catalog/publish-patch-release.sh <release> <build-host> <staged-dir> <os>...` publishes a release that
+rebuilds only the named templates: every other image is carried over from the current release byte for byte (hard links in the
+store, same `version`), and a rebuilt template whose VM image was not rebuilt keeps the previous qcow2 under the new version
+(`entry.file` keeps the old file name). Hosts therefore download only the rebuilt archives; everything else is already present.
