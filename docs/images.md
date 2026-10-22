@@ -25,3 +25,12 @@ racksdock-images manifest os-options /var/lib/racksdock/images/manifest.signed.j
 images), installs the open-kernel-module server driver branch with fallbacks (exact pin → branch → proprietary → newest), and for
 `verify` installs DCGM (skipped with a warning where unavailable), the CUDA toolkit, nccl-tests and nvbandwidth. The node-agent runs
 as root in the VM (docs/node-agent-privileges.md).
+
+## Container-tier images (`container-image/`)
+
+`container-image/build.sh <os> <release>` builds `racksdock/<os>:<release>` with docker: `ubuntu24.04` (tenant: sshd, nested Docker,
+node-agent) from `ubuntu:24.04`, and `verify` (DCGM 4, fio, iperf3, sysbench, memtester, nccl-tests, nvbandwidth, STREAM) from the
+CUDA devel image. The host's NVIDIA driver is injected at run time by the container toolkit, so images carry no driver. The same
+in-image tools (`racksdock-memtest`, `racksdock-launch`, ...) are copied from `image-build/overlay`. `racksdock-images manifest build
+<dir> <release> --containers` adds entries of kind `container` pinned to the docker image id; the host-agent refuses an image whose
+id differs. `dev/vmtest/build-container-images.sh verify ubuntu24.04` does build, manifest, sign and catalog in one go.

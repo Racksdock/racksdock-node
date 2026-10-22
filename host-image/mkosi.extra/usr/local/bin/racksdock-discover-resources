@@ -94,15 +94,16 @@ def main() -> int:
     ap.add_argument("--hugepage-kib", type=int, default=0, help="1048576 for 1 GiB hugepage backing (pages must be reserved at boot); 0 = none")
     ap.add_argument("--pci-mmio64-mb", type=int, default=0, help="OVMF 64-bit MMIO window (8xB300: 2048000); 0 = OVMF default")
     ap.add_argument("--vm-dir", type=Path, default=Path("/var/lib/racksdock/vms"))
+    ap.add_argument("--deployment", choices=("vm", "container"), default="vm", help="container: GPUs stay with the host driver (no IOMMU/VFIO needed)")
     a = ap.parse_args()
 
     problems: list[str] = []
-    if not Path("/sys/kernel/iommu_groups").exists() or not any(Path("/sys/kernel/iommu_groups").iterdir()):
+    if a.deployment == "vm" and (not Path("/sys/kernel/iommu_groups").exists() or not any(Path("/sys/kernel/iommu_groups").iterdir())):
         problems.append("no IOMMU groups: enable IOMMU in BIOS and boot with amd_iommu=on (or intel_iommu=on) iommu=pt")
     gpus = sorted(a_ for a_ in os.listdir(PCI) if pci_class(a_).startswith(("0x0300", "0x0302")) and vendor(a_) == "0x10de")
     nvswitch = sorted(a_ for a_ in os.listdir(PCI) if pci_class(a_).startswith("0x0680") and vendor(a_) == "0x10de")
     extra: list[str] = []
-    for g in gpus:
+    for g in gpus if a.deployment == "vm" else []:
         for m in group_members(g):
             if m == g or m in gpus or m in extra or is_bridge(m):
                 continue

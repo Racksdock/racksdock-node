@@ -18,6 +18,7 @@ dev = ["ruff>=0.5"]
 [project.scripts]
 racksdock-host-agent = "racksdock_node.host_agent.main:main"
 racksdock-node-agent = "racksdock_node.node_agent.main:main"
+racksdock-container-init = "racksdock_node.node_agent.containerinit:main"
 racksdock-images = "racksdock_node.images.cli:app"
 
 [tool.setuptools.packages.find]

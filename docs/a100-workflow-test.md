@@ -165,3 +165,21 @@ On the A100 box: `userdel -r ubuntu`, `rm -rf /opt/racksdock /etc/racksdock /var
 Generic pieces that may stay (not A100-specific): the hardware profile mechanism (`core/profile.py`, `spec/profiles/b300x8.json`),
 the `static` host-agent backend and its test (lab boxes without passthrough, never production), `RACKSDOCK_IPERF_ENDPOINTS`,
 `RACKSDOCK_SSH_USER`, and the `racksdock-stream` fallback tool.
+
+## 6. Container tier on the A100 (2026-10-21)
+
+The second A100 box (a cloud VM without nested virtualization) is deployed as a **container-tier** node of the single platform on V
+(`RACKSDOCK_HOST_AGENT_MODE=docker`, docs/01 §10), replacing static mode:
+
+```bash
+# on the box (identity kept from the earlier setup; RESERVE/DATA sized for a small VM)
+DEPLOYMENT=container PLATFORM_URL=http://<V>:8000 PUBLIC_IP=<A> PROFILE=a100-dev TRUST_MODE=dev REPOS=/root/racksdock \
+  RESERVE_CPUS=4 RESERVE_MEM_GB=16 DATA_DISK_GB=40 MINER_HOTKEY=5FminerA100 bash /root/racksdock/racksdock-node/host-image/scripts/setup-host.sh
+PYTHON=/opt/racksdock/venv/bin/python bash /root/racksdock/racksdock-platform/dev/vmtest/build-container-images.sh ubuntu24.04 verify
+systemctl restart racksdock-host-agent        # mode docker, port 20022 -> container sshd
+# on V: register (updates the node's deployment to container; same node_id)
+RACKSDOCK_HOTKEY=5FminerA100 racksdock-miner bootstrap --host-pubkey <host key>
+```
+
+Tenants get a root container with the GPU, nested Docker, an encrypted 40 GB `/data` managed by the host, SSH on port 20022 as
+`ubuntu` or `root` with their keys. Validators score the node at half (tier factor 0.5).

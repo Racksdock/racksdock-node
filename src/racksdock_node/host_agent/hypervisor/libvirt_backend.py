@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import re
-import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,9 +21,9 @@ from racksdock_subnet.core.schemas import VmResources
 from ..cloudinit import build_seed_iso, network_config
 from .base import VmHandle, VmSpec
 from .libvirt_xml import OVMF_CODE, OVMF_VARS, build_domain_xml, passthrough_addresses
+from .nat import NAT_TAG, apply_rules, clear_rules, detect_ext_iface, forward_rules, parse_tagged_rules  # noqa: F401 (re-exported)
 
 log = logging.getLogger("racksdock.host-agent.libvirt")
-NAT_TAG = "racksdock-nat"
 VM_FILES = ("os.qcow2", "data.qcow2", "seed.iso", "nvram.fd", "domain.xml")  # console.log is kept for diagnostics
 
 
@@ -38,36 +37,15 @@ async def _run(*cmd: str, check: bool = True, timeout: float = 120) -> subproces
 
 
 def nat_rules(host_ip: str, port: int, vm_ip: str, tag: str) -> list[tuple[str, list[str]]]:
-    """iptables rules (table, args) forwarding host:port -> vm_ip:22, tagged with a comment so they can be removed by tag.
-    PREROUTING serves remote clients, OUTPUT serves clients on the host itself, FORWARD admits the new connection past
-    libvirt's default 'no inbound to the NAT network' rule."""
-    c = ["-m", "comment", "--comment", tag]
-    return [
-        ("nat", ["PREROUTING", "-p", "tcp", "--dport", str(port), "-j", "DNAT", "--to-destination", f"{vm_ip}:22", *c]),
-        ("nat", ["OUTPUT", "-p", "tcp", "-d", host_ip, "--dport", str(port), "-j", "DNAT", "--to-destination", f"{vm_ip}:22", *c]),
-        ("filter", ["FORWARD", "-d", vm_ip, "-p", "tcp", "--dport", "22", "-j", "ACCEPT", *c]),
-    ]
-
-
-def parse_tagged_rules(iptables_save: str, tag_prefix: str) -> list[tuple[str, list[str]]]:
-    """From `iptables-save` output, every rule whose comment starts with tag_prefix, as (table, args-after-'-A')."""
-    out: list[tuple[str, list[str]]] = []
-    table = ""
-    for line in iptables_save.splitlines():
-        if line.startswith("*"):
-            table = line[1:].strip()
-        elif line.startswith("-A "):
-            args = shlex.split(line[3:])
-            if "--comment" in args and args[args.index("--comment") + 1].startswith(tag_prefix):
-                out.append((table, args))
-    return out
+    """SSH-only forward (kept for callers/tests); forward_rules() is the full policy."""
+    return forward_rules(host_ip, vm_ip, port, tag, expose="ssh")
 
 
 class LibvirtBackend:
     name = "libvirt"
 
     def __init__(self, bridge: str = "br0", host_cores: list[list[int]] | None = None, public_ip: str | None = None, gateway: str | None = None,
-                 net_mode: str = "bridge", nat_network: str = "default", nat_ssh_port: int = 20022, guest_files: dict[str, str] | None = None):
+                 net_mode: str = "bridge", nat_network: str = "default", nat_ssh_port: int = 20022, guest_files: dict[str, str] | None = None, expose: str = "all", reserved_ports: list[int] | None = None):
         self.bridge = bridge
         self.host_cores = host_cores or self._discover_host_cores()
         self.public_ip = public_ip
@@ -75,6 +53,8 @@ class LibvirtBackend:
         self.net_mode = net_mode
         self.nat_network = nat_network
         self.nat_ssh_port = nat_ssh_port
+        self.expose = expose
+        self.reserved_ports = list(reserved_ports or [22])
         self.guest_files = guest_files or {}
         self._nat_tasks: dict[str, asyncio.Task] = {}
 
@@ -155,7 +135,10 @@ class LibvirtBackend:
             data_disk = spec.vm_dir / "data.qcow2"
             await _run("qemu-img", "create", "-q", "-f", "qcow2", str(data_disk), f"{spec.resources.data_disk_gb}G")
         net_cfg = None if self.nat else network_config(spec.public_ip, self.gateway)
-        build_seed_iso(seed, spec.user_data, spec.metadata, spec.hostname, net_cfg, extra_files=self.guest_files or None)
+        extra = dict(self.guest_files)
+        if spec.operator_keys:
+            extra["__ssh_authorized_keys__"] = spec.operator_keys
+        build_seed_iso(seed, spec.user_data, spec.metadata, spec.hostname, net_cfg, extra_files=extra or None)
         xml = build_domain_xml(name, spec.resources, overlay, seed, nvram, self.host_cores, bridge=None if self.nat else self.bridge,
                                nat_network=self.nat_network if self.nat else None, data_disk=data_disk, console_log=spec.vm_dir / "console.log")
         (spec.vm_dir / "domain.xml").write_text(xml)
@@ -182,12 +165,24 @@ class LibvirtBackend:
             vm_ip = await self._wait_lease(handle.name, timeout=300)
             handle.extra["vm_ip"] = vm_ip
             await self._nat_clear(f"{NAT_TAG}-{handle.instance_id}")
-            for table, args in nat_rules(handle.ip or "", handle.ssh_port, vm_ip, f"{NAT_TAG}-{handle.instance_id}"):
-                await _run("iptables", "-w", "-t", table, "-I", args[0], "1", *args[1:])
-            log.info("%s: forwarding %s:%d -> %s:22", handle.name, handle.ip, handle.ssh_port, vm_ip)
+            await apply_rules(_run, forward_rules(handle.ip or "", vm_ip, handle.ssh_port, f"{NAT_TAG}-{handle.instance_id}", expose=self.expose, reserved_ports=self.reserved_ports, ext_iface=await detect_ext_iface(_run)))
+            log.info("%s: forwarding %s:%d -> %s:22%s", handle.name, handle.ip, handle.ssh_port, vm_ip,
+                     f" and every other port (except {','.join(str(p) for p in self.reserved_ports)}) 1:1" if self.expose == "all" else "")
         except Exception as e:
             log.error("%s: NAT setup failed: %s", handle.name, e)
             handle.extra["nat_error"] = str(e)
+
+    async def refresh_forwarding(self, handle: VmHandle) -> None:
+        """Re-install this rental's forwarding rules under the current exposure policy (used when a restarted host-agent adopts
+        a running VM). The VM's address comes from the handle or from its current lease."""
+        if not self.nat:
+            return
+        vm_ip = handle.extra.get("vm_ip") or await self._wait_lease(handle.name, timeout=30)
+        handle.extra["vm_ip"] = vm_ip
+        tag = f"{NAT_TAG}-{handle.instance_id}"
+        await self._nat_clear(tag)
+        await apply_rules(_run, forward_rules(handle.ip or "", vm_ip, handle.ssh_port, tag, expose=self.expose, reserved_ports=self.reserved_ports, ext_iface=await detect_ext_iface(_run)))
+        log.info("%s: forwarding refreshed (%s) -> %s", handle.name, self.expose, vm_ip)
 
     async def _wait_lease(self, name: str, timeout: float) -> str:
         for _ in range(int(timeout / 2)):
@@ -198,12 +193,8 @@ class LibvirtBackend:
             await asyncio.sleep(2)
         raise TimeoutError(f"no DHCP lease for {name} within {timeout:.0f}s (is the guest's NIC up? virsh console {name})")
 
-    async def _nat_clear(self, tag_prefix: str) -> None:
-        if shutil.which("iptables-save") is None:
-            return
-        cp = await _run("iptables-save", check=False)
-        for table, args in parse_tagged_rules(cp.stdout, tag_prefix):
-            await _run("iptables", "-w", "-t", table, "-D", *args, check=False)
+    async def _nat_clear(self, tag_prefix: str, exclude_prefix: str | None = None) -> None:
+        await clear_rules(_run, shutil.which, tag_prefix, exclude_prefix)
 
     async def detect_host_ip(self) -> str:
         cp = await _run("ip", "-j", "route", "get", "1.1.1.1", check=False)
@@ -251,19 +242,20 @@ class LibvirtBackend:
                 except OSError:
                     pass
 
-    async def cleanup_stale(self, vm_root: Path) -> list[str]:
-        """On host-agent start: no racksdock VM may survive a host-agent restart (it holds the GPUs and the agent has no record
-        of it). Destroys every `racksdock-*` domain, drops every tagged NAT rule, removes leftover VM files."""
+    async def cleanup_stale(self, vm_root: Path, keep: VmHandle | None = None) -> list[str]:
+        """On host-agent start: a racksdock VM the agent has no record of holds the GPUs for nobody, so every `racksdock-*`
+        domain except the adopted one (`keep`, re-read from the agent's state) is destroyed, its NAT rules dropped and its
+        files removed. The adopted VM, its port forward and its files are left alone."""
         cp = await _run("virsh", "list", "--all", "--name", check=False)
-        names = [n for n in cp.stdout.split() if n.startswith("racksdock-")]
+        names = [n for n in cp.stdout.split() if n.startswith("racksdock-") and (keep is None or n != keep.name)]
         for n in names:
             log.warning("destroying stale VM %s", n)
             await _run("virsh", "destroy", n, check=False)
             await _run("virsh", "undefine", "--nvram", n, check=False)
-        await self._nat_clear(NAT_TAG)
+        await self._nat_clear(NAT_TAG, exclude_prefix=f"{NAT_TAG}-{keep.instance_id}" if keep else None)
         if vm_root.exists():
             for d in vm_root.iterdir():
-                if d.is_dir():
+                if d.is_dir() and not (keep is not None and d.name == keep.instance_id):
                     for f in VM_FILES:
                         try:
                             (d / f).unlink()

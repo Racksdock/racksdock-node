@@ -4,7 +4,15 @@ import argparse, sys
 
 ap = argparse.ArgumentParser(); ap.add_argument("--fraction", type=float, default=0.9); a = ap.parse_args()
 total_kb = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
-target = int(total_kb * 1024 * a.fraction)
+avail = total_kb * 1024
+try:  # container tier: /proc/meminfo shows the host; the cgroup limit is what we may use
+    lim = open("/sys/fs/cgroup/memory.max").read().strip()
+    cur = int(open("/sys/fs/cgroup/memory.current").read().strip() or 0)
+    if lim.isdigit():
+        avail = min(avail, int(lim) - cur)
+except (OSError, ValueError):
+    pass
+target = int(avail * a.fraction)
 chunk = 256 * 2**20
 pattern = bytes([0xA5, 0x5A, 0xB3, 0x00]) * (chunk // 4)
 chunks = []

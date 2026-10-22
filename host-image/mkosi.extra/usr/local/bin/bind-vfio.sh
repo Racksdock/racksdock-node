@@ -7,6 +7,8 @@
 # group is a host layout problem that discover-resources reports instead.
 set -euo pipefail
 modprobe vfio-pci
+lsmod | grep -q '^nvidia ' && nvidia-smi -pm 0 >/dev/null 2>&1 || true   # dual hosts: let the host driver release the GPUs
+modprobe -r nvidia_drm nvidia_modeset nvidia_uvm 2>/dev/null || true   # dual hosts: drop the host driver's companions before the GPUs leave it
 modprobe vhost_vsock 2>/dev/null || true
 bind() {
   local addr="$1" dev="/sys/bus/pci/devices/$1"

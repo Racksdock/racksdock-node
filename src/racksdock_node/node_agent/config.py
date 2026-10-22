@@ -20,6 +20,7 @@ class NodeAgentConfig:
     cloudinit_user_data: Path = Path("/var/lib/cloud/instance/user-data.txt")
     data_device: str = "/dev/disk/by-id/racksdock-data"
     data_mount: Path = Path("/data")
+    data_host_managed: bool = False  # container tier: the host mounts an encrypted volume at data_mount; nothing to format or erase here
     metrics_port: int = 9100
     image_version: str = "unknown"
     sim_node_dir: Path | None = None
@@ -40,6 +41,7 @@ class NodeAgentConfig:
             cloudinit_user_data=Path(e("RACKSDOCK_CLOUDINIT_USER_DATA", "/var/lib/cloud/instance/user-data.txt")),
             data_device=e("RACKSDOCK_DATA_DEVICE", "/dev/disk/by-id/racksdock-data"),
             data_mount=Path(e("RACKSDOCK_DATA_MOUNT", "/data")),
+            data_host_managed=e("RACKSDOCK_DATA_HOST_MANAGED", "0") == "1",
             metrics_port=int(e("RACKSDOCK_METRICS_PORT", "9100")),
             image_version=e("RACKSDOCK_IMAGE_VERSION", _read_image_version()),
             sim_node_dir=Path(e("RACKSDOCK_SIM_NODE_DIR")) if e("RACKSDOCK_SIM_NODE_DIR") else None,

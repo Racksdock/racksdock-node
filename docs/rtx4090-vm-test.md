@@ -110,6 +110,82 @@ disks (`vda`, `vdb`) and the VM's 192.168.122.x address only. The host's root fi
 host's network are not reachable. The remaining gap is the one documented in docs/05: the **miner** controls the hypervisor and
 could read VM memory; no CC in this design.
 
+## 4a. Result (2026-10-20)
+
+Passed end to end on the box, in `real` mode: registration from a bootstrap VM, admission test (all four demonstrations incl. forced
+recovery via `virsh reboot`), full qualification (Q2, Q3, Q7, Q8, Q9–Q13) in 53 min, tenant rental with verified attestation and
+SSH login, 10/10 in-rental checks, delete. Measured inside the VM: 8× RTX 4090 (21.0 GiB usable each, VBIOS 95.02.3C), EPYC 75F3
+120 vCPU (STREAM 45 GB/s, sysbench 299k), 431 GB RAM, virtio data disk 5.5/2.1 GB/s seq, 157k/27k IOPS, 1.78 GB/s sustained,
+network 16.6/32.5 Gbps (VM↔host). The tenant VM showed exactly its own devices (`vda` 200G, `vdb` 500G, 8 GPUs, 120 CPUs).
+
+Bugs found and fixed on the way (all in production code): cloud image root filesystem not grown before customizing; copy-in target
+missing; `pipefail` + `head -1` aborting the setup script; iperf3 missing on the host; the node-agent and launch units ordered after
+`cloud-init.target` (systemd ordering cycle; the agent was silently skipped on most boots); image path doubled the OS prefix;
+`manifest verify` argument form; Python stdout buffering through `tee`; stale test state across runs; the 4090 memory floor set
+too tight (22 GiB vs 21.0 measured).
+
+## 4b. Rent the node yourself
+
+The scripted run exercises the tenant journey automatically. To use the node like a customer, keep the platform, host-agent and
+validator up and drive the CLI or the web console by hand:
+
+```bash
+/opt/racksdock/venv/bin/python -u /root/racksdock/racksdock-platform/dev/vmtest/run_vm_test.py --manual --keep-state --port 8000 --bind 0.0.0.0
+```
+
+`--keep-state` reuses the previous run's database, so the node is already registered and qualified (no bootstrap, no 53-minute
+suite). `--port 8000 --bind 0.0.0.0` puts the console at `http://172.19.4.67:8000/` for machines on that network (or tunnel:
+`ssh -L 8000:127.0.0.1:8000 root@<box>`). The runner prints the full CLI sequence (sign-up, key, credits, create, `racksdock ssh`,
+delete) and stays up until Ctrl+C. Inside the VM, Docker with `--gpus all` works; `/data` is the encrypted data disk.
+
+If `racksdock nodes list` shows `avail no` with no VM running, a previous run left an instance in `deleting`: the platform now
+closes such an instance (and releases the node's lease) about a minute after the host-agent's heartbeat reports no VM. Before
+that fix, delete it by hand under its owner (`RACKSDOCK_HOME=<that user's home> racksdock instances delete <id>`). A CLI config from
+an earlier run may still point at the old random port: `racksdock auth login --email ... --password ... --api-url http://127.0.0.1:8000`.
+
+Found during the manual rental (2026-10-20 evening): the agent's `/data` mount was invisible to the tenant because the unit had
+`ProtectHome=read-only` (a private mount namespace). Fixed in the unit; built images need `dev/vmtest/patch-images.sh` once no
+rental is running. Workaround inside an affected VM: `sudo mount /dev/mapper/racksdockdata /data`.
+
+## 4c. Tenant benchmark findings (2026-10-21) and what they mean
+
+A full benchmark inside a tenant VM (Qwen3-8B LoRA/QLoRA/full fine-tune, burns, VRAM tests) reported: healthy GPUs
+(164 TFLOPS bf16, 920 GB/s, 0 VRAM errors, 35 min at 445 W each with 0 errors, peak 77 °C), 8-GPU LoRA at 92% scaling, but slow
+GPU-to-GPU traffic (~1.3 GB/s NCCL), GPU 0 on a PCIe x8 link, and one 12-minute freeze of the whole VM.
+
+- **The freeze was not the platform.** Host journal: at 00:44 UTC a root shell on the host ran
+  `virsh dump <vm> --memory-only --live` (470 GB memory dump, `/var/tmp/vm-forensics/racksdock-memory.elf`, finished 00:56).
+  QEMU's memory dump stops the vCPUs for the duration; the guest clock jumps when it resumes. Exactly the "miner/host operator can
+  read VM memory" capability docs/05 describes. Delete the dump when done (470 GB).
+- **The validator could not see the freeze**: its in-rental task died on the platform's `{"error": "node-agent unreachable"}`
+  answer (pydantic error, unretrieved) and wrote no record for 12 minutes. Fixed: every failed challenge is now an in-rental record
+  with `attestation_ok=false` and the error; test in `tests/validator/test_inrental_and_q7.py`.
+- **Bogus strikes**: the in-rental check treated NVML throttle bit 0x4 (SW power cap, i.e. "running at the power limit") as a
+  fault and raised a power_profile incident with a strike every minute of the tenant's burn (35 strikes, instance marked
+  degraded). Fixed: only HW/thermal/power-brake slowdowns count, and they raise an incident without a strike; the 35 strikes and
+  incidents were removed from the test database and the instance restored to active.
+- **GPU 0 at x8** is a hardware fact of the box (`lspci` on the host: `Width x8 (downgraded)`), a riser or slot issue. Q7 now
+  fails a node whose per-GPU host bandwidth or PCIe link width is an outlier, so a validator catches this at qualification.
+- **Slow GPU-to-GPU**: GeForce has no P2P, so NCCL goes through host memory. On this host the guest RAM is 4 KiB-page backed
+  (no hugepages reserved) and `iommu=pt` is off, which makes every GPU DMA to host memory go through small IOMMU entries. The
+  production host image reserves 1 GiB hugepages; on this box: `HUGEPAGES_GB=440 bash setup-host.sh`, reboot, then
+  `HUGEPAGE_KIB=1048576` in the setup (or `hugepage_kib` in resources.json). Expect a large NCCL/H2D improvement and
+  near-instant VM starts. Not done yet (needs a reboot of the box).
+- The `NCCL_SHM_USE_CUDA_MEMCPY=1` deadlock is an NCCL/driver matter inside the guest, not something the platform sets.
+
+## 4c. Tenant benchmark on the rental (2026-10-21) and what it taught the validator
+
+The user's own benchmark of the rented VM (Qwen3-8B fine-tuning, burns, memory tests) found: GPUs healthy (164 TFLOPS bf16,
+920 GB/s, 0 VRAM errors, 35 min at 445 W each); 8-GPU LoRA 15k tokens/s; full fine-tuning slow because NCCL over host memory
+reaches only ~1.3 GB/s (GeForce has no P2P; the VM's guest RAM is 4 KiB-page backed, so GPU DMA to host memory pays IOMMU
+translation, which 1 GiB hugepages would avoid); GPU 0 on a PCIe x8 link (host-side `lspci` confirms: slot/riser); and one
+12-minute VM freeze. The freeze was `virsh dump --memory-only --live` of the 470 GB VM, run on the host by the benchmark's own
+forensics at 00:44-00:56 UTC (host journal), not the platform. Validator fixes that came out of it (all with tests):
+`inrental.py` treated the normal SW power cap (0x4) as throttling and filed a strike + incident every minute of the burn (35 of
+each, instance marked degraded) -> mask is now HW/thermal/power-brake slowdowns only, throttle incidents carry no strike; the
+in-rental task died on a `{"error": ...}` challenge reply instead of recording a failed check (the freeze was invisible for 12 min);
+Q7 always passed -> now flags per-GPU host-link outliers (< 60 % of the node median) and PCIe links narrower than their maximum.
+
 ## 5. If something fails
 
 | Symptom | Where | Fix |

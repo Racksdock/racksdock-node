@@ -84,6 +84,8 @@ class DataDisk:
     def open(self) -> bool:
         if self.opened:
             return True
+        if self.cfg.data_host_managed:
+            return Path(self.cfg.data_mount).is_mount()  # provided (and erased) by the host-agent; opened stays False
         if self.cfg.sim:
             self.key = bytearray(secrets.token_bytes(64))
             self.opened = True
@@ -92,6 +94,14 @@ class DataDisk:
         if dev is None or shutil.which("cryptsetup") is None:
             return False
         self.device = dev
+        if Path(f"/dev/mapper/{self.mapper}").exists():
+            # the agent was restarted inside a running VM (e.g. killed by the guest's OOM killer): the disk is already open and
+            # formatted by the previous process. Adopt it instead of re-formatting (which fails on a busy device and used to
+            # crash the agent in a loop). The key is not in this process; erase() still wipes the LUKS header at teardown.
+            if not self._mounted():
+                subprocess.run(["mount", f"/dev/mapper/{self.mapper}", str(self.cfg.data_mount)], check=False, capture_output=True)
+            self.opened = True
+            return True
         self.key = bytearray(secrets.token_bytes(64))
         keyfile = Path("/run/racksdock/data.key")
         keyfile.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +123,12 @@ class DataDisk:
                 keyfile.unlink()
             except OSError:
                 pass
+
+    def _mounted(self) -> bool:
+        try:
+            return any(line.split()[1] == str(self.cfg.data_mount) for line in Path("/proc/mounts").read_text().splitlines())
+        except OSError:
+            return False
 
     def erase(self) -> None:
         if self.key is not None:

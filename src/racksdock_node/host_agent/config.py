@@ -24,12 +24,14 @@ class NetworkConfig:
     public_ip: str | None = None
     nat_network: str = "default"
     nat_ssh_port: int = 20022
+    expose: str = "all"  # all: the whole public IP (every port except reserved_ports) is forwarded 1:1 to the rental | ssh: only nat_ssh_port
+    reserved_ports: list[int] = field(default_factory=lambda: [22])  # host ports never forwarded (the host's own sshd)
     sriov_vf_pci: str | None = None
 
 
 @dataclass
 class HostAgentConfig:
-    mode: str = "real"  # real | sim | static
+    mode: str = "real"  # real (KVM VM) | docker (container tier) | dual (both, customer picks) | sim | static
     platform_ws: str = "ws://127.0.0.1:8000/v1/hosts/ws"
     state_dir: Path = Path("/var/lib/racksdock-host-agent")
     key_path: Path = Path("/var/lib/racksdock-host-agent/host.seed")
@@ -41,9 +43,19 @@ class HostAgentConfig:
     vm_dir: Path = Path("/var/lib/racksdock/vms")
     agent_port: int = VSOCK_PORT
     agent_transport: str = "vsock"  # vsock | tcp
+    agent_bind_host: str = "127.0.0.1"  # tcp transport: docker mode binds the docker bridge gateway so the container can reach it
+    # docker mode (container tier, docs/01 §10)
+    docker_data_dir: Path = Path("/var/lib/racksdock/containers")
+    docker_image_repo: str = "racksdock"
+    docker_privileged: bool = True  # nested Docker + GPU reset need it; sysbox is the non-privileged alternative
+    docker_shm_gb: int = 64
+    docker_bridge: str = "docker0"
+    docker_data_gb: int = 0  # per-rental encrypted volume (0: the node's data_disk_gb, else 200 GiB)
     resources: VmResources = field(default_factory=VmResources)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     heartbeat_interval_s: float = 30.0
+    catalog_url: str | None = None  # platform image store (default: http://<platform host>/catalog/current); empty string disables sync
+    catalog_sync_s: float = 600.0
     boot_timeout_s: float = 900.0
     teardown_ack_timeout_s: float = 60.0
     # simulation
@@ -67,6 +79,34 @@ class HostAgentConfig:
         return self.mode == "static"
 
     @property
+    def docker(self) -> bool:
+        return self.mode == "docker"
+
+    @property
+    def dual(self) -> bool:
+        return self.mode == "dual"
+
+    @property
+    def image_kinds(self) -> tuple[str, ...]:
+        return {"docker": ("container",), "dual": ("vm", "container"), "static": ()}.get(self.mode, ("vm",))
+
+    @property
+    def effective_catalog_url(self) -> str | None:
+        """None when sync is disabled (RACKSDOCK_CATALOG_URL=''); otherwise the configured URL or the platform's /catalog/current."""
+        if self.catalog_url is not None:
+            return self.catalog_url or None
+        from urllib.parse import urlparse
+
+        u = urlparse(self.platform_ws)
+        scheme = "https" if u.scheme == "wss" else "http"
+        return f"{scheme}://{u.netloc}/catalog/current" if u.netloc else None
+
+    @property
+    def deployment(self) -> str:
+        """Tier recorded in the registration: KVM VM (real, sim), Docker container (docker), or the machine itself (static, lab)."""
+        return {"real": "vm", "sim": "vm", "docker": "container", "static": "static", "dual": "dual"}.get(self.mode, "vm")
+
+    @property
     def metadata_carries_user_data(self) -> bool:
         """sim and static VMs cannot read cloud-init's copy of the user-data, so the host sends it over the agent link."""
         return self.mode in ("sim", "static")
@@ -87,6 +127,7 @@ class HostAgentConfig:
             agent_port=int(e("RACKSDOCK_AGENT_PORT", str(VSOCK_PORT))),
             agent_transport=e("RACKSDOCK_AGENT_TRANSPORT", "vsock"),
             heartbeat_interval_s=float(e("RACKSDOCK_HEARTBEAT_S", "30")),
+            catalog_url=e("RACKSDOCK_CATALOG_URL"), catalog_sync_s=float(e("RACKSDOCK_CATALOG_SYNC_S", "600")),
             sim_node_dir=Path(e("RACKSDOCK_SIM_NODE_DIR")) if e("RACKSDOCK_SIM_NODE_DIR") else None,
             sim_node_agent_cmd=e("RACKSDOCK_SIM_NODE_AGENT_CMD", "racksdock-node-agent"),
             sim_faults_file=Path(e("RACKSDOCK_SIM_FAULTS")) if e("RACKSDOCK_SIM_FAULTS") else None,
@@ -99,11 +140,23 @@ class HostAgentConfig:
         if e("RACKSDOCK_NET_MODE"):
             cfg.network = NetworkConfig(mode=e("RACKSDOCK_NET_MODE", "bridge"), bridge=e("RACKSDOCK_NET_BRIDGE", "br0"),
                                         public_ip=e("RACKSDOCK_PUBLIC_IP") or None, nat_network=e("RACKSDOCK_NAT_NETWORK", "default"),
-                                        nat_ssh_port=int(e("RACKSDOCK_NAT_SSH_PORT", "20022")), sriov_vf_pci=e("RACKSDOCK_SRIOV_VF_PCI"))
+                                        nat_ssh_port=int(e("RACKSDOCK_NAT_SSH_PORT", "20022")), sriov_vf_pci=e("RACKSDOCK_SRIOV_VF_PCI"),
+                                        expose=e("RACKSDOCK_NAT_EXPOSE", "all"),
+                                        reserved_ports=[int(p) for p in e("RACKSDOCK_NAT_RESERVED_PORTS", "22").split(",") if p.strip()])
         if cfg.sim or cfg.static:
             cfg.agent_transport = "tcp"
             if not e("RACKSDOCK_AGENT_PORT"):
                 cfg.agent_port = 0  # ephemeral: several simulated hosts can share one machine
+        if cfg.docker or cfg.dual:
+            if cfg.docker:
+                cfg.agent_transport = "tcp"  # dual keeps vsock for VMs and adds the TCP listener for containers
+            cfg.agent_bind_host = e("RACKSDOCK_AGENT_BIND_HOST", "")  # empty: the docker bridge gateway, detected at start
+            cfg.docker_data_dir = Path(e("RACKSDOCK_DOCKER_DATA_DIR", "/var/lib/racksdock/containers"))
+            cfg.docker_image_repo = e("RACKSDOCK_DOCKER_IMAGE_REPO", "racksdock")
+            cfg.docker_privileged = e("RACKSDOCK_DOCKER_PRIVILEGED", "1") == "1"
+            cfg.docker_shm_gb = int(e("RACKSDOCK_DOCKER_SHM_GB", "64"))
+            cfg.docker_bridge = e("RACKSDOCK_DOCKER_BRIDGE", "docker0")
+            cfg.docker_data_gb = int(e("RACKSDOCK_DOCKER_DATA_GB", "0"))
         cfg.static_public_ip = e("RACKSDOCK_STATIC_PUBLIC_IP", "127.0.0.1")
         cfg.static_ssh_port = int(e("RACKSDOCK_STATIC_SSH_PORT", "22"))
         cfg.static_authorized_keys = Path(e("RACKSDOCK_STATIC_AUTHORIZED_KEYS", "/home/ubuntu/.ssh/authorized_keys"))

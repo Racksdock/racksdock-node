@@ -12,9 +12,10 @@ log = logging.getLogger("racksdock.host-agent.agentlink")
 
 
 class AgentLink:
-    def __init__(self, transport: str, port: int):
+    def __init__(self, transport: str, port: int, bind_host: str = "127.0.0.1"):
         self.transport = transport
         self.port = port
+        self.bind_host = bind_host
         self.server: asyncio.AbstractServer | None = None
         self.writer: asyncio.StreamWriter | None = None
         self.on_message: Callable[[AgentMessage], Awaitable[None]] | None = None
@@ -30,7 +31,7 @@ class AgentLink:
             s.setblocking(False)
             self.server = await asyncio.start_server(self._handle, sock=s)
         else:
-            self.server = await asyncio.start_server(self._handle, "127.0.0.1", self.port)
+            self.server = await asyncio.start_server(self._handle, self.bind_host, self.port)
             self.port = self.server.sockets[0].getsockname()[1]
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -84,3 +85,51 @@ class AgentLink:
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+
+
+class MultiAgentLink:
+    """Dual-mode hosts: one listener per transport (vsock for VMs, TCP on the docker bridge for containers). Messages from either
+    reach the same handler; sends go to whichever node-agent is connected."""
+
+    def __init__(self, links: list[AgentLink]):
+        self.links = links
+        self._on_message: Callable[[AgentMessage], Awaitable[None]] | None = None
+
+    @property
+    def on_message(self):
+        return self._on_message
+
+    @on_message.setter
+    def on_message(self, fn) -> None:
+        self._on_message = fn
+        for link in self.links:
+            link.on_message = fn
+
+    @property
+    def port(self) -> int:
+        return self.links[0].port
+
+    async def start(self) -> None:
+        for link in self.links:
+            await link.start()
+
+    async def send(self, msg: AgentMessage) -> bool:
+        for link in self.links:
+            if link.writer is not None and not link.writer.is_closing():
+                return await link.send(msg)
+        return False
+
+    async def wait_connected(self, timeout: float) -> bool:
+        tasks = [asyncio.create_task(link.wait_connected(timeout)) for link in self.links]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        return any(t.result() for t in done)
+
+    async def drop(self) -> None:
+        for link in self.links:
+            await link.drop()
+
+    async def stop(self) -> None:
+        for link in self.links:
+            await link.stop()

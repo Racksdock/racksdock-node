@@ -20,7 +20,8 @@ Restart=always
 RestartSec=2
 RuntimeDirectory=racksdock
 RuntimeDirectoryPreserve=yes
-ProtectHome=read-only
+# No mount-namespace sandboxing (ProtectHome, ProtectSystem, PrivateTmp, ...): the agent mounts the encrypted data disk at /data
+# and that mount must be visible to the tenant, not only inside a private namespace (found on the 8x4090 test).
 
 [Install]
 WantedBy=multi-user.target

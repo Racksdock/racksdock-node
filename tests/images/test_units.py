@@ -36,3 +36,11 @@ def test_node_agent_unit_waits_for_cloud_init_init_stage():
     after = _section(unit, "Unit")["After"]
     assert "cloud-init.service" in after  # user-data copy, host keys and vendor-data files exist after the init stage
     assert "ExecStart" in _section(unit, "Service") and "User" not in _section(unit, "Service")  # runs as root (docs/node-agent-privileges.md)
+
+
+def test_node_agent_unit_has_no_mount_namespace_sandboxing():
+    """The agent mounts /data for the tenant. ProtectHome/ProtectSystem/PrivateTmp/ReadOnlyPaths put the service in a private mount
+    namespace, so the mount existed only for the agent and the tenant saw /data on the root disk (8x4090 test, 2026-10-20)."""
+    svc = _section((UNITS / "racksdock-node-agent.service").read_text(), "Service")
+    for opt in ("ProtectHome", "ProtectSystem", "PrivateTmp", "ReadOnlyPaths", "ReadWritePaths", "TemporaryFileSystem", "PrivateMounts"):
+        assert opt not in svc, f"{opt}= would hide the /data mount from the tenant"

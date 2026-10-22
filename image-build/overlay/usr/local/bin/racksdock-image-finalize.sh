@@ -4,7 +4,7 @@
 # node-agent, compiles STREAM and (for the verify image) installs DCGM, the CUDA toolkit, nccl-tests and nvbandwidth, and enables
 # the racksdock units. The node-agent venv is created by build.sh after this script.
 set -euo pipefail
-OS="$1"; RELEASE="$2"; DRIVER="$3"; CUDA="${4:-}"
+OS="$1"; RELEASE="$2"; DRIVER="$3"; CUDA="${4:-}"; PYTORCH="${5:-}"
 export DEBIAN_FRONTEND=noninteractive
 . /etc/os-release
 DIST="ubuntu$(echo "$VERSION_ID" | tr -d .)"
@@ -38,12 +38,38 @@ fi
 apt-mark hold $(dpkg-query -W -f='${Package}\n' 'nvidia-*' 2>/dev/null | tr '\n' ' ') >/dev/null 2>&1 || true
 apt-get install -y -q nvidia-container-toolkit
 apt-get install -y -q "nvidia-fabricmanager-${MAJOR}" && systemctl enable nvidia-fabricmanager || echo "NOTE: Fabric Manager not installed (only needed with NVSwitch)"
+# NVIDIA's unit runs persistenced with --no-persistence-mode and has no [Install] section: override both so the GPUs stay
+# initialized between processes (fast nvidia-smi / CUDA start on an 8-GPU rental)
+mkdir -p /etc/systemd/system/nvidia-persistenced.service.d
+cat > /etc/systemd/system/nvidia-persistenced.service.d/racksdock.conf <<'EOT'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nvidia-persistenced --user nvidia-persistenced --verbose
+[Install]
+WantedBy=multi-user.target
+EOT
 systemctl enable nvidia-persistenced docker ssh cloud-init 2>/dev/null || true
 nvidia-ctk runtime configure --runtime=docker
 
 if [ -n "$CUDA" ]; then
   apt-get install -y -q "cuda-toolkit-${CUDA/./-}" libnccl2 libnccl-dev
   apt-get install -y -q "libcudnn9-cuda-${CUDA%%.*}" || echo "NOTE: cuDNN package for CUDA ${CUDA} not available"
+fi
+
+if [ -n "$PYTORCH" ]; then
+  # PyTorch template: torch/torchvision/torchaudio wheels for this CUDA line into the system Python (so `python3 -c "import torch"`
+  # just works), plus JupyterLab; the exact versions are recorded for the attestation panel
+  # a dedicated environment (system site-packages visible) so pip never fights Debian-owned packages; it becomes the default
+  # python for every shell (/etc/profile.d) and for `python3` on PATH (/usr/local/bin symlinks); /usr/bin/python3 stays untouched
+  CU="cu$(echo "$CUDA" | tr -d .)"
+  apt-get install -y -q python3-venv python3-pip
+  python3 -m venv --system-site-packages /opt/pytorch
+  /opt/pytorch/bin/pip install --no-cache-dir "torch==${PYTORCH}.*" torchvision torchaudio --index-url "https://download.pytorch.org/whl/${CU}"
+  /opt/pytorch/bin/pip install --no-cache-dir jupyterlab
+  for b in python python3 pip pip3 jupyter jupyter-lab; do ln -sf "/opt/pytorch/bin/$b" "/usr/local/bin/$b"; done
+  echo 'export PATH=/opt/pytorch/bin:$PATH' > /etc/profile.d/pytorch.sh
+  mkdir -p /etc/racksdock
+  /opt/pytorch/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" | tee /etc/racksdock/pytorch-version
 fi
 
 # STREAM (compiled from the official source at build time); racksdock-stream is the Python fallback

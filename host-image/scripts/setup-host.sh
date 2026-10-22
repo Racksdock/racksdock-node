@@ -14,13 +14,20 @@
 #   REGION         region label (default: lab)
 #   PROFILE        RACKSDOCK_PROFILE (default: b300x8)
 #   TRUST_MODE     prod | dev (dev: GPUs without device attestation, e.g. Ampere/Ada test boxes; default prod)
+#   DEPLOYMENT     vm (default: KVM VM, needs bare metal or nested virtualization) | dual (bare metal offering BOTH tiers: the
+#                  customer picks at launch; the host-agent rebinds the GPUs between VFIO and the NVIDIA driver) | container (Docker tier: a root container with
+#                  all GPUs via the NVIDIA container toolkit, nested Docker, host-managed encrypted /data; works on any machine with
+#                  the NVIDIA driver, e.g. cloud VMs without nested virtualization; validators score it at half)
 #   NET_MODE       nat | bridge (default nat: single-IP hosts; VMs are reached at host:NAT_SSH_PORT)
 #   NAT_SSH_PORT   default 20022      PUBLIC_IP   address tenants connect to (default: auto from the default route)
 #   BRIDGE         bridge name for NET_MODE=bridge (default br0)
 #   RESERVE_CPUS / RESERVE_MEM_GB   kept for the host (default 8 / 64)
 #   DATA_DISK_GB   virtio data disk for the VM (default: auto, 500 GB when space allows); PASSTHROUGH_NVME=1 passes free
 #                  non-root NVMe controllers through instead (they are CRYPTO-ERASED after every rental!)
-#   HUGEPAGE_KIB   1048576 to back the VM with 1 GiB hugepages (reserve them at boot first); default 0
+#   HUGEPAGE_KIB   1048576 to back the VM with 1 GiB hugepages; default 0
+#   HUGEPAGES_GB   reserve this many 1 GiB pages at boot (adds default_hugepagesz=1G hugepagesz=1G hugepages=N iommu=pt to GRUB,
+#                  needs a reboot; implies HUGEPAGE_KIB=1048576). Recommended: the VM's memory_gb + 1. Without hugepages, GPU DMA
+#                  into guest memory goes through 4 KiB IOMMU mappings (NCCL over host memory measured 1.3 GB/s on the 8x4090 box).
 #   PYTHON         interpreter >= 3.11 for the racksdock venv (default: python3.11 or python3; deadsnakes is added on 22.04)
 set -euo pipefail
 trap 'echo "setup-host.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
@@ -29,13 +36,56 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPOS="${REPOS:-$(cd "$HERE/../../.." && pwd)}"
 PLATFORM_URL="${PLATFORM_URL:-}"
 PROFILE="${PROFILE:-b300x8}"; TRUST_MODE="${TRUST_MODE:-prod}"; NET_MODE="${NET_MODE:-nat}"; NAT_SSH_PORT="${NAT_SSH_PORT:-20022}"
+DEPLOYMENT="${DEPLOYMENT:-vm}"
 REGION="${REGION:-lab}"; MINER_HOTKEY="${MINER_HOTKEY:-5FminerTest}"
 export DEBIAN_FRONTEND=noninteractive
 step() { echo; echo "== $*"; }
 
+if [ "$DEPLOYMENT" = dual ]; then
+  step "1. packages for both tiers (KVM/libvirt/OVMF for VMs; Docker, NVIDIA container toolkit and the NVIDIA driver for containers)"
+  apt-get update -q
+  apt-get install -y -q qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients ovmf libguestfs-tools iptables pciutils nvme-cli jq curl chrony iperf3 python3 python3-venv cryptsetup
+  command -v docker >/dev/null || apt-get install -y -q docker.io
+  if ! command -v nvidia-ctk >/dev/null; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -q && apt-get install -y -q nvidia-container-toolkit
+  fi
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia || { nvidia-ctk runtime configure --runtime=docker && systemctl restart docker; }
+  if ! modinfo -n nvidia >/dev/null 2>&1; then
+    # the host driver for container rentals (same major as the container tier's reference hosts); blacklisted from auto-loading
+    # (step 2) and loaded on demand by bind-host-driver.sh. Ubuntu's own packages first, NVIDIA's CUDA repository as fallback.
+    DRV="${HOST_DRIVER:-580}"
+    if ! apt-get install -y -q "nvidia-driver-${DRV}-open"; then
+      . /etc/os-release; DIST="ubuntu$(echo "$VERSION_ID" | tr -d .)"
+      curl -fsSL "https://developer.download.nvidia.com/compute/cuda/repos/${DIST}/x86_64/cuda-keyring_1.1-1_all.deb" -o /tmp/cuda-keyring.deb && dpkg -i /tmp/cuda-keyring.deb && apt-get update -q
+      apt-get install -y -q "nvidia-driver-${DRV}-open" || apt-get install -y -q "nvidia-driver-${DRV}-server-open" || { echo "ERROR: no NVIDIA ${DRV} open driver for this release (set HOST_DRIVER=<major>)"; exit 1; }
+    fi
+  fi
+  systemctl disable --now nvidia-persistenced nvidia-dcgm nvidia-fabricmanager >/dev/null 2>&1 || true
+  systemctl mask nvidia-persistenced >/dev/null 2>&1 || true   # never on a dual host: it pins the devices and its socket breaks container starts when it flaps
+  # the driver package's udev rules start persistenced and modprobe nvidia-drm/modeset/uvm on every bind; on a dual host the GPUs
+  # are rebound many times a day and those rules stalled udevd (which then blocks cryptsetup/device-mapper): neutralize them
+  echo "# racksdock dual-mode host: NVIDIA udev automation is handled by bind-host-driver.sh" > /etc/udev/rules.d/71-nvidia.rules
+  udevadm control --reload >/dev/null 2>&1 || true
+elif [ "$DEPLOYMENT" = container ]; then
+  step "1. packages (Docker, NVIDIA container toolkit, cryptsetup for the per-rental data volume)"
+  apt-get update -q
+  apt-get install -y -q ca-certificates curl jq pciutils cryptsetup iperf3 python3 python3-venv chrony
+  command -v docker >/dev/null || apt-get install -y -q docker.io
+  if ! command -v nvidia-ctk >/dev/null; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    apt-get update -q && apt-get install -y -q nvidia-container-toolkit
+  fi
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia || { nvidia-ctk runtime configure --runtime=docker && systemctl restart docker; }
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  nvidia-smi -L | head -3
+else
 step "1. packages (KVM, libvirt, OVMF, libguestfs for image builds, iptables, NVMe/PCI tools)"
 apt-get update -q
 apt-get install -y -q qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients ovmf libguestfs-tools iptables pciutils nvme-cli jq curl chrony iperf3 python3 python3-venv
+fi
 . /etc/os-release
 PY="${PYTHON:-}"
 if [ -z "$PY" ]; then
@@ -48,6 +98,9 @@ if [ -z "$PY" ]; then
 fi
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || { echo "PYTHON=$PY is older than 3.11"; exit 1; }
 
+if [ "$DEPLOYMENT" = container ]; then
+  step "2-3. container tier: the host keeps its NVIDIA driver; no VFIO, libvirt or hugepages"
+else
 step "2. kernel: IOMMU, KVM, vfio-pci, vhost_vsock, host NVIDIA driver blacklist"
 [ -e /dev/kvm ] || { echo "ERROR: /dev/kvm missing: enable virtualization (AMD-V / VT-x) in the BIOS"; exit 1; }
 if [ -z "$(ls /sys/kernel/iommu_groups 2>/dev/null)" ]; then
@@ -57,13 +110,32 @@ printf 'vfio-pci\nvhost_vsock\n' > /etc/modules-load.d/racksdock.conf
 modprobe vfio-pci; modprobe vhost_vsock
 grep -v '^softdep nvme' "$HERE/../mkosi.extra/etc/modprobe.d/racksdock-vfio.conf" > /etc/modprobe.d/racksdock-vfio.conf   # host driver never claims the GPUs again
 update-initramfs -u >/dev/null 2>&1 || true
-if ! grep -q 'iommu=pt' /proc/cmdline; then echo "NOTE: add 'iommu=pt' to GRUB_CMDLINE_LINUX_DEFAULT for best passthrough performance (not required)"; fi
+if [ -n "${HUGEPAGES_GB:-}" ]; then
+  HUGEPAGE_KIB=1048576
+  if ! grep -q "hugepagesz=1G" /etc/default/grub; then
+    sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 default_hugepagesz=1G hugepagesz=1G hugepages=${HUGEPAGES_GB} iommu=pt\"/" /etc/default/grub
+    update-grub >/dev/null 2>&1 && echo "GRUB: ${HUGEPAGES_GB} x 1 GiB hugepages + iommu=pt will apply at the next reboot"
+  fi
+  grep -q "HugePages_Total: *${HUGEPAGES_GB}" /proc/meminfo || echo "NOTE: reboot before starting the host-agent (hugepages are reserved at boot)"
+elif ! grep -q 'iommu=pt' /proc/cmdline; then echo "NOTE: add 'iommu=pt' to GRUB_CMDLINE_LINUX_DEFAULT for best passthrough performance (not required)"; fi
+# HUGEPAGES_GB=<n>: reserve n x 1 GiB hugepages at boot for the VM and set iommu=pt (production host image default). Guest memory
+# backed by 1 GiB pages maps the IOMMU with large entries: GPU DMA to host memory (NCCL over PCIe, H2D copies) is much faster
+# than with 4 KiB pages, and VM start no longer spends minutes pinning memory. Takes effect after a reboot; then use
+# HUGEPAGE_KIB=1048576 so resources.json asks for hugepage backing.
+if [ -n "${HUGEPAGES_GB:-}" ]; then
+  if grep -q "hugepages=${HUGEPAGES_GB}" /proc/cmdline; then echo "hugepages already reserved: $(grep HugePages_Total /proc/meminfo)"; else
+    sed -i -E "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"([^\"]*)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 default_hugepagesz=1G hugepagesz=1G hugepages=${HUGEPAGES_GB} iommu=pt\"/" /etc/default/grub
+    sed -i -E 's/  +/ /g; s/=" /="/' /etc/default/grub
+    update-grub >/dev/null 2>&1 && echo "GRUB: reserving ${HUGEPAGES_GB} x 1 GiB hugepages + iommu=pt at next boot. REBOOT, then rerun with HUGEPAGE_KIB=1048576."
+  fi
+fi
 
 step "3. libvirt + NAT network"
 systemctl enable --now libvirtd >/dev/null
 virsh net-info default >/dev/null 2>&1 || virsh net-define /usr/share/libvirt/networks/default.xml
 virsh net-autostart default >/dev/null; virsh net-start default 2>/dev/null || true
 virsh net-info default | grep -E 'Active|Bridge'
+fi
 
 step "4. GPU facts (before the host driver is unloaded)"
 mkdir -p /etc/racksdock
@@ -77,6 +149,7 @@ fi
 [ -f /etc/racksdock/gpu-facts.json ] || { PCI_ID=$(lspci -Dn | awk '$2 ~ /^030[02]:/ && $3 ~ /^10de:/ && !found {print $3; found=1}'); printf '{"pci_id": "%s", "memory_mib": %s, "name": "unknown"}\n' "$PCI_ID" "${GPU_MEMORY_MIB:-0}" > /etc/racksdock/gpu-facts.json; }
 cat /etc/racksdock/gpu-facts.json
 
+if [ "$DEPLOYMENT" != container ]; then
 step "5. unload the host NVIDIA driver (the GPUs belong to the VM from now on)"
 systemctl stop nvidia-persistenced nvidia-fabricmanager nvidia-dcgm 2>/dev/null || true
 if grep -q '^nvidia' /proc/modules; then
@@ -85,21 +158,27 @@ if grep -q '^nvidia' /proc/modules; then
     echo "         Stop them and rerun, or reboot (the blacklist is installed) and rerun."; exit 1
   fi
 fi
+fi
 
 step "6. discover VM resources -> /etc/racksdock/resources.json"
 install -m 755 "$HERE/../mkosi.extra/usr/local/bin/racksdock-discover-resources" /usr/local/bin/racksdock-discover-resources
-DISC=(--reserve-cpus "${RESERVE_CPUS:-8}" --reserve-mem-gb "${RESERVE_MEM_GB:-64}" --hugepage-kib "${HUGEPAGE_KIB:-0}")
+DISC=(--reserve-cpus "${RESERVE_CPUS:-8}" --reserve-mem-gb "${RESERVE_MEM_GB:-64}" --hugepage-kib "${HUGEPAGE_KIB:-0}" --deployment "$DEPLOYMENT")
 [ -n "${DATA_DISK_GB:-}" ] && DISC+=(--data-disk-gb "$DATA_DISK_GB")
 [ "${PASSTHROUGH_NVME:-0}" = 1 ] && DISC+=(--passthrough-nvme)
 [ -n "${PCI_MMIO64_MB:-}" ] && DISC+=(--pci-mmio64-mb "$PCI_MMIO64_MB")
 racksdock-discover-resources --out /etc/racksdock/resources.json "${DISC[@]}" || { echo "fix the PROBLEM lines above, then rerun"; exit 1; }
 
+if [ "$DEPLOYMENT" = container ]; then
+step "7. container tier: GPUs stay with the host driver (docker --gpus all hands them to the rental container)"
+else
 step "7. bind GPUs (and their IOMMU-group companions) to vfio-pci, now and at every boot"
 install -m 755 "$HERE/../mkosi.extra/usr/local/bin/bind-vfio.sh" /usr/local/bin/bind-vfio.sh
+[ "$DEPLOYMENT" = dual ] && install -m 755 "$HERE/../mkosi.extra/usr/local/bin/bind-host-driver.sh" /usr/local/bin/bind-host-driver.sh
 install -m 644 "$HERE/../mkosi.extra/etc/systemd/system/racksdock-bind-vfio.service" /etc/systemd/system/
 systemctl daemon-reload; systemctl enable racksdock-bind-vfio.service >/dev/null
 /usr/local/bin/bind-vfio.sh
 for a in $(jq -r '.gpu_pci[], .extra_pci[]' /etc/racksdock/resources.json); do printf '  %s -> %s\n' "$a" "$(basename "$(readlink -f /sys/bus/pci/devices/$a/driver)")"; done
+fi
 
 step "8. racksdock software -> /opt/racksdock/venv"
 [ -d /opt/racksdock/venv ] || "$PY" -m venv /opt/racksdock/venv
@@ -119,7 +198,12 @@ if [ "$TRUST_MODE" = dev ]; then
   V=/opt/racksdock/venv/bin/racksdock-verify
   if [ -n "$PLATFORM_URL" ]; then
     RACKSDOCK_PROFILE=$PROFILE $V devca fetch "$PLATFORM_URL" /etc/racksdock/devca
-    RACKSDOCK_PROFILE=$PROFILE $V devca fetch-node "$PLATFORM_URL" /etc/racksdock/node --count "$COUNT" --pci-id "$PCI_ID" --memory-mib "$MEM_MIB"
+    # keep an identity already issued for this host (its node_id must not change on a rerun); issue one only if missing
+    if [ "$(ls /etc/racksdock/node/devices 2>/dev/null | grep -c '\.pem$')" = "$COUNT" ] && [ -z "${REISSUE_IDENTITY:-}" ]; then
+      echo "node identity present (${COUNT} devices); keeping it (REISSUE_IDENTITY=1 to replace)"
+    else
+      RACKSDOCK_PROFILE=$PROFILE $V devca fetch-node "$PLATFORM_URL" /etc/racksdock/node --count "$COUNT" --pci-id "$PCI_ID" --memory-mib "$MEM_MIB"
+    fi
   else
     [ -f /etc/racksdock/devca/root.pem ] || $V devca init /etc/racksdock/devca
     RACKSDOCK_PROFILE=$PROFILE $V devca issue-node /etc/racksdock/devca /etc/racksdock/node --count "$COUNT" --pci-id "$PCI_ID" --memory-mib "$MEM_MIB"
@@ -137,7 +221,7 @@ step "10. host-agent configuration"
 PUBLIC_IP="${PUBLIC_IP:-$(ip -j route get 1.1.1.1 2>/dev/null | jq -r '.[0].prefsrc' 2>/dev/null || hostname -I | awk '{print $1}')}"
 WS="${PLATFORM_WS:-$(echo "${PLATFORM_URL:-http://127.0.0.1:8000}" | sed -E 's#^http#ws#')/v1/hosts/ws}"
 cat > /etc/racksdock/host-agent.env <<ENV
-RACKSDOCK_HOST_AGENT_MODE=real
+RACKSDOCK_HOST_AGENT_MODE=$(case "$DEPLOYMENT" in container) echo docker;; dual) echo dual;; *) echo real;; esac)
 RACKSDOCK_PROFILE=$PROFILE
 RACKSDOCK_PLATFORM_WS=$WS
 RACKSDOCK_MINER_HOTKEY=$MINER_HOTKEY
@@ -152,11 +236,24 @@ RACKSDOCK_NAT_SSH_PORT=$NAT_SSH_PORT
 RACKSDOCK_PUBLIC_IP=$PUBLIC_IP
 $TRUST_ENV
 ENV
-install -m 644 "$HERE/../mkosi.extra/etc/systemd/system/racksdock-host-agent.service" /etc/systemd/system/racksdock-host-agent.service
+if [ "$DEPLOYMENT" = container ]; then
+  # container hosts have no libvirt: the unit depends on docker instead
+  sed -e 's/^After=.*/After=network-online.target docker.service/' -e 's/^Requires=.*/Requires=docker.service/' \
+    "$HERE/../mkosi.extra/etc/systemd/system/racksdock-host-agent.service" > /etc/systemd/system/racksdock-host-agent.service
+else
+  install -m 644 "$HERE/../mkosi.extra/etc/systemd/system/racksdock-host-agent.service" /etc/systemd/system/racksdock-host-agent.service
+fi
 systemctl daemon-reload
 cat /etc/racksdock/host-agent.env
 echo
 echo "Host ready. Next:"
+if [ "$DEPLOYMENT" = container ]; then
+echo "  build + sign the container images: bash $REPOS/racksdock-platform/dev/vmtest/build-container-images.sh verify ubuntu24.04"
+elif [ "$DEPLOYMENT" = dual ]; then
+echo "  VM images (if not built yet):      bash $REPOS/racksdock-platform/dev/vmtest/build-images.sh verify ubuntu24.04"
+echo "  container images + one manifest:   bash $REPOS/racksdock-platform/dev/vmtest/build-container-images.sh verify ubuntu24.04"
+else
 echo "  build + sign the catalog images:  bash $REPOS/racksdock-platform/dev/vmtest/build-images.sh verify ubuntu24.04"
+fi
 echo "  single-box workflow test:          /opt/racksdock/venv/bin/python $REPOS/racksdock-platform/dev/vmtest/run_vm_test.py"
 echo "  or run the host-agent as a service: systemctl enable --now racksdock-host-agent   (journalctl -fu racksdock-host-agent)"

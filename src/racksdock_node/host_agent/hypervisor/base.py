@@ -21,6 +21,8 @@ class VmSpec:
     hostname: str = "racksdock"
     public_ip: str | None = None
     ssh_port: int = 22
+    deployment: str | None = None  # dual nodes: vm | container for this rental
+    operator_keys: str | None = None  # dev trust mode, bootstrap launches only: operator SSH public keys added to the guest
 
 
 @dataclass

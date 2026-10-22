@@ -130,7 +130,11 @@ class NodeAgent:
         )
         env = SignedEnvelope.create("boot_evidence", ev.model_dump(mode="json"), self.key)
         await conn.send(AgentMessage(type="evidence", payload=env.model_dump()))
-        disk_ok = self.disk.open()
+        try:
+            disk_ok = self.disk.open()
+        except Exception as e:
+            log.error("data disk setup failed: %s", e)
+            disk_ok = False
         await conn.send(AgentMessage(type="status", payload=StatusUpdate(
             status=InstanceStatus.pending, status_details="attested; applying cloud-init" + ("" if disk_ok else "; data disk unavailable"),
             ssh_port=m.ssh_port, ssh_host_key_line=self.host_key_line).model_dump(mode="json")))

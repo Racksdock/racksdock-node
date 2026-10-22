@@ -7,13 +7,16 @@
 set -euo pipefail
 trap 'echo "build.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 OS="$1"; RELEASE="$2"; DRIVER="${3:-580.82.07}"; CUDA="${4:-}"
+# template names carry their CUDA / PyTorch versions: pytorch-2.9-cuda13.0, ubuntu24.04-cuda13.0
+[ -z "$CUDA" ] && CUDA="$(echo "$OS" | grep -oE 'cuda[0-9]+\.[0-9]+' | sed 's/cuda//' || true)"
+PYTORCH="${PYTORCH:-$(echo "$OS" | grep -oE '^pytorch-[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/pytorch-//' || true)}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="${OUT_DIR:-$HERE/out}"; CACHE="${CACHE_DIR:-$HERE/cache}"; mkdir -p "$OUT" "$CACHE"
 PY="${PYTHON:-python3}"
 "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || { echo "PYTHON=$PY is older than 3.11 (needed to build the racksdock wheels)"; exit 1; }
 case "$OS" in
   ubuntu22.04*) BASE_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"; GUEST_PY=3.11;;
-  ubuntu24.04*|verify) BASE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"; GUEST_PY=3.12;;
+  ubuntu24.04*|verify|pytorch-*) BASE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"; GUEST_PY=3.12;;
   *) echo "unknown os $OS"; exit 1;;
 esac
 BASE="$CACHE/$(basename "$BASE_URL")"
@@ -36,7 +39,7 @@ NODE_WHL="$(ls "$WHEELS"/racksdock_node-*.whl)"
 virt-customize -a "$IMG" --smp "${BUILD_CPUS:-8}" --memsize "${BUILD_MEM_MB:-8192}" \
   --install "$PKGS" \
   --mkdir /opt/racksdock --copy-in "$HERE/overlay/usr:/" --copy-in "$HERE/overlay/etc:/" --copy-in "$WHEELS:/opt/racksdock/" \
-  --run-command "bash /usr/local/bin/racksdock-image-finalize.sh '$OS' '$RELEASE' '$DRIVER' '$CUDA'" \
+  --run-command "bash /usr/local/bin/racksdock-image-finalize.sh '$OS' '$RELEASE' '$DRIVER' '$CUDA' '$PYTORCH'" \
   --run-command "PYBIN=\$(command -v python$GUEST_PY || command -v python3); \$PYBIN -m venv /opt/racksdock/venv && /opt/racksdock/venv/bin/pip install -q --no-index --find-links /opt/racksdock/wheels-$GUEST_PY 'racksdock-node[nvml]' && ln -sf /opt/racksdock/venv/bin/racksdock-node-agent /usr/local/bin/racksdock-node-agent && rm -rf /opt/racksdock/wheels-$GUEST_PY" \
   --write "/etc/racksdock/image-version:${OS}_${RELEASE}" \
   --selinux-relabel

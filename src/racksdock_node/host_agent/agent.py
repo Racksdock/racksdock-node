@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
+from dataclasses import asdict
 from pathlib import Path
 
 from racksdock_subnet.core.agentproto import AgentMessage, Metadata
@@ -32,6 +34,7 @@ from .hypervisor.base import HypervisorBackend, VmHandle, VmSpec
 from .platformlink import PlatformLink
 
 log = logging.getLogger("racksdock.host-agent")
+EVIDENCE_MIN_INTERVAL_S = 60.0  # boot evidence relayed at most this often once an instance is active
 
 
 class HostAgent:
@@ -40,7 +43,17 @@ class HostAgent:
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
         self.key = SigningKey.load_or_create(cfg.key_path)
         self.backend = backend or self._make_backend()
-        self.agentlink = AgentLink(cfg.agent_transport, cfg.agent_port)
+        bind = cfg.agent_bind_host
+        if (cfg.docker or cfg.dual) and not bind:
+            from .hypervisor.docker_backend import DockerBackend
+
+            bind = DockerBackend.bridge_gateway(cfg.docker_bridge)
+        if cfg.dual:
+            from .agentlink import MultiAgentLink
+
+            self.agentlink = MultiAgentLink([AgentLink("vsock", cfg.agent_port), AgentLink("tcp", cfg.agent_port, bind_host=bind or "127.0.0.1")])
+        else:
+            self.agentlink = AgentLink(cfg.agent_transport, cfg.agent_port, bind_host=bind or "127.0.0.1")
         self.agentlink.on_message = self._on_agent_message
         self.platform = PlatformLink(cfg.platform_ws, self.key, self._hello)
         self.platform.on_command = self._on_command
@@ -48,9 +61,12 @@ class HostAgent:
         self.node_id: str | None = self._load_node_id()
         self.current: VmHandle | None = None
         self.current_launch: LaunchCommand | None = None
+        self.images: list[str] | None = None  # catalog images present ("<version>:<kind>"); None until the first inventory
         self.maintenance_until: str | None = None
         self._pending_identity: asyncio.Future | None = None
         self._teardown_ack: asyncio.Event = asyncio.Event()
+        self._last_evidence_at: float = 0.0
+        self._hello_count: int = 0
         self._boot_timer: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
@@ -68,11 +84,26 @@ class HostAgent:
                 env.update({"RACKSDOCK_TRUST_MODE": "dev", "RACKSDOCK_DEV_CA_DIR": str(self.cfg.trust.dev_ca_dir), "RACKSDOCK_SIM_NODE_DIR": str(self.cfg.sim_node_dir)})
             return StaticBackend(self.cfg.agent_port, self.cfg.static_public_ip, self.cfg.static_ssh_port, self.cfg.static_authorized_keys,
                                  self.cfg.sim_node_agent_cmd, env, self.cfg.state_dir / "static", ssh_service=self.cfg.static_ssh_service)
+        if self.cfg.docker or self.cfg.dual:
+            from .hypervisor.docker_backend import DockerBackend
+
+            n = self.cfg.network
+            docker = DockerBackend(public_ip=n.public_ip, ssh_port=n.nat_ssh_port, data_dir=self.cfg.docker_data_dir, image_dir=self.cfg.image_dir,
+                                   image_repo=self.cfg.docker_image_repo, guest_files=self._dev_guest_files(), agent_port=self.cfg.agent_port,
+                                   agent_host=self.cfg.agent_bind_host, privileged=self.cfg.docker_privileged, shm_gb=self.cfg.docker_shm_gb, bridge=self.cfg.docker_bridge,
+                                   data_gb=self.cfg.docker_data_gb, expose=n.expose, reserved_ports=n.reserved_ports)
+            if self.cfg.docker:
+                return docker
+            from .hypervisor.dual_backend import DualBackend
+            from .hypervisor.libvirt_backend import LibvirtBackend
+
+            vm = LibvirtBackend(bridge=n.bridge, public_ip=n.public_ip, net_mode=n.mode, nat_network=n.nat_network, nat_ssh_port=n.nat_ssh_port, guest_files=self._dev_guest_files(), expose=n.expose, reserved_ports=n.reserved_ports)
+            return DualBackend(vm, docker, self.cfg.resources, self.cfg.state_dir)
         from .hypervisor.libvirt_backend import LibvirtBackend
 
         n = self.cfg.network
         return LibvirtBackend(bridge=n.bridge, public_ip=n.public_ip, net_mode=n.mode, nat_network=n.nat_network, nat_ssh_port=n.nat_ssh_port,
-                              guest_files=self._dev_guest_files())
+                              guest_files=self._dev_guest_files(), expose=n.expose, reserved_ports=n.reserved_ports)
 
     def _dev_guest_files(self) -> dict[str, str]:
         """Dev trust mode on real hardware (GPUs without device attestation): the VM needs the dev CA certificates and this node's
@@ -82,9 +113,8 @@ class HostAgent:
         if not t.dev or t.dev_ca_dir is None or self.cfg.sim_node_dir is None:
             return {}
         files = {"/etc/racksdock/node-agent.env": "RACKSDOCK_TRUST_MODE=dev\nRACKSDOCK_DEV_CA_DIR=/etc/racksdock/devca\nRACKSDOCK_SIM_NODE_DIR=/etc/racksdock/node\n"}
-        if self.cfg.dev_ssh_pubkey:
-            # operator access to every VM for debugging the real path on a lab box; cloud-init adds it to the default user
-            files["__ssh_authorized_keys__"] = self.cfg.dev_ssh_pubkey.strip() + "\n"
+        # the operator's dev SSH key (RACKSDOCK_DEV_SSH_PUBKEY) is NOT part of these files: it only rides on bootstrap launches
+        # (VmSpec.operator_keys); a tenant's or validator's rental never carries a key its owner did not choose
         for src, dst in ((Path(t.dev_ca_dir), "/etc/racksdock/devca"), (Path(self.cfg.sim_node_dir), "/etc/racksdock/node")):
             if not src.exists():
                 raise RuntimeError(f"dev trust mode: {src} missing (racksdock-verify devca fetch / fetch-node)")
@@ -97,12 +127,87 @@ class HostAgent:
         p = self.cfg.state_dir / "node_id"
         return p.read_text().strip() if p.exists() else None
 
+    # ---- the running rental survives a host-agent restart (upgrade, crash): its handle and launch command are kept on disk and
+    # re-adopted at start when the VM/container is still running; anything else named racksdock-* is stale and destroyed
+    @property
+    def _current_file(self) -> Path:
+        return self.cfg.state_dir / "current.json"
+
+    def _save_current(self) -> None:
+        if self.current is None or self.current_launch is None:
+            self._current_file.unlink(missing_ok=True)
+            return
+        self._current_file.write_text(json.dumps({"handle": asdict(self.current), "launch": self.current_launch.model_dump(mode="json")}, indent=1))
+
+    async def _adopt_current(self) -> VmHandle | None:
+        """Returns the handle cleanup_stale() must keep. A record that cannot be fully understood still protects its VM/container
+        from being destroyed (the worst outcome of a host-agent upgrade is a tenant losing a rental, not a stale handle)."""
+        p = self._current_file
+        if not p.exists():
+            return None
+        try:
+            d = json.loads(p.read_text())
+            handle = VmHandle(**{k: v for k, v in d["handle"].items() if k in VmHandle.__dataclass_fields__})
+        except Exception as e:
+            log.warning("could not read the previous rental record (%s); starting clean", e)
+            p.unlink(missing_ok=True)
+            return None
+        try:
+            lc = LaunchCommand.model_validate(d["launch"])
+            state = await self.backend.state(handle)
+        except Exception as e:
+            log.error("previous rental %s: cannot verify its state (%s); keeping it untouched, not adopting", handle.instance_id, e)
+            return handle
+        if state != "running":
+            log.warning("previous rental %s is %s; not adopting", handle.instance_id, state)
+            p.unlink(missing_ok=True)
+            return None
+        self.current, self.current_launch = handle, lc
+        log.info("adopted running %s for instance %s (%s)", handle.name, handle.instance_id, "active" if handle.extra.get("active") else "still booting")
+        if handle.extra.get("active") is not True:
+            self._boot_timer = asyncio.create_task(self._boot_watchdog(handle.instance_id))
+        refresh = getattr(self.backend, "refresh_forwarding", None)
+        if refresh is not None:
+            try:
+                await refresh(handle)  # a newer exposure policy applies to the adopted rental too
+            except Exception as e:
+                log.warning("could not refresh port forwarding for %s: %s", handle.instance_id, e)
+        return handle
+
     def _hello(self) -> HostEvent:
         return HostEvent(kind="hello", node_id=self.node_id, payload={
             "host_pubkey": self.key.public.hex, "host_image_version": self.cfg.host_image_version, "host_agent_version": __version__,
             "miner_hotkey": self.cfg.miner_hotkey, "region": self.cfg.region, "inventory": self.backend.host_inventory(),
             "vm_state": "running" if self.current else "none", "instance_id": self.current.instance_id if self.current else None,
+            "images": self.images,
         })
+
+    # ---- catalog: the platform publishes signed image releases; the host keeps the kinds it runs in sync and reports what it has
+    def _inventory(self) -> list[str] | None:
+        if self.cfg.sim or self.cfg.static:
+            return None
+        from racksdock_node.images.sync import local_images
+
+        return local_images(self.cfg.image_dir, self.cfg.image_kinds)
+
+    async def _catalog_loop(self) -> None:
+        from racksdock_node.images.sync import sync_catalog
+
+        url = self.cfg.effective_catalog_url
+        while True:
+            if url:
+                try:
+                    r = await asyncio.to_thread(sync_catalog, url, self.cfg.image_dir, self.cfg.image_kinds, Path("/etc/racksdock/catalog.pub"),
+                                                lambda s: log.info("catalog: %s", s))
+                    if r["fetched"]:
+                        log.info("catalog %s: fetched %s", r["release"], ", ".join(r["fetched"]))
+                except Exception as e:
+                    log.warning("catalog sync failed: %s", str(e)[:300])
+            before = self.images
+            self.images = await asyncio.to_thread(self._inventory)
+            if self.images != before:
+                log.info("catalog images present: %s", ", ".join(self.images or []) or "none")
+            await asyncio.sleep(self.cfg.catalog_sync_s)
 
     async def run(self) -> None:
         log.info("host-agent started: mode=%s node_id=%s host_key=%s platform=%s region=%s", self.cfg.mode, (self.node_id or "unregistered")[:24],
@@ -112,20 +217,26 @@ class HostAgent:
             # process-based backends need the actual bound port
             self.backend.agent_port = self.agentlink.port  # type: ignore[attr-defined]
         else:
+            keep = await self._adopt_current()
             cleanup = getattr(self.backend, "cleanup_stale", None)
             if cleanup is not None:
-                stale = await cleanup(self.cfg.vm_dir)
+                stale = await cleanup(self.cfg.vm_dir, keep=keep)
                 if stale:
                     log.warning("removed %d stale VM(s) left by a previous host-agent: %s", len(stale), ", ".join(stale))
             preflight = getattr(self.backend, "preflight", None)
             if preflight is not None:
                 for problem in await preflight(self.cfg.resources):
+                    if keep is not None and "hugepages free" in problem:
+                        continue  # the adopted rental holds the pool; that is not a host problem
                     log.warning("preflight: %s", problem)
         hb = asyncio.create_task(self._heartbeat_loop())
+        cat = asyncio.create_task(self._catalog_loop()) if not (self.cfg.sim or self.cfg.static) else None
         try:
             await self.platform.run()
         finally:
             hb.cancel()
+            if cat is not None:
+                cat.cancel()
             await self.agentlink.stop()
 
     def stop(self) -> None:
@@ -139,7 +250,7 @@ class HostAgent:
                                                                      host_image_version=self.cfg.host_image_version,
                                                                      vm_state=(await self.backend.state(self.current)) if self.current else None,
                                                                      instance_id=self.current.instance_id if self.current else None,
-                                                                     maintenance_until=self.maintenance_until).model_dump()))
+                                                                     maintenance_until=self.maintenance_until, images=self.images).model_dump()))
 
     # ---- platform commands ---------------------------------------------------
     async def _on_command(self, cmd: HostCommand) -> None:
@@ -173,17 +284,22 @@ class HostAgent:
                             image_version=lc.image_version, user_data=lc.user_data, ssh_port=lc.ssh_port)
             spec = VmSpec(instance_id=lc.instance_id, image=lc.image, image_version=lc.image_version, user_data=lc.user_data, metadata=meta,
                           resources=self.cfg.resources, vm_dir=self.cfg.vm_dir / lc.instance_id,
-                          image_path=self.cfg.image_dir / f"{lc.image_version}.qcow2", hostname=f"racksdock-{lc.instance_id[-8:]}",
-                          public_ip=self.cfg.network.public_ip, ssh_port=lc.ssh_port)
+                          image_path=self.cfg.image_dir / f"{lc.image_version}.qcow2", hostname=f"racksdock-{lc.instance_id[-8:]}", deployment=lc.deployment,
+                          public_ip=self.cfg.network.public_ip, ssh_port=lc.ssh_port,
+                          operator_keys=(self.cfg.dev_ssh_pubkey.strip() + "\n") if self.cfg.dev_ssh_pubkey and lc.instance_id.startswith("bootstrap-") else None)
             self.current_launch = lc
             self._teardown_ack.clear()
+            self._last_evidence_at = 0.0
+            self._hello_count = 0
             try:
                 self.current = await self.backend.launch(spec)
             except Exception as e:
                 self.current_launch = None
+                log.error("launch of %s (%s) failed: %s", lc.instance_id, lc.deployment or self.cfg.deployment, str(e)[:1500])
                 await self._status(lc.instance_id, InstanceStatus.error, f"launch failed: {e}")
                 return
             self.log.record("vm_started", instance_id=lc.instance_id, mode=lc.mode.value, image=lc.image)
+            self._save_current()
             await self.platform.send(HostEvent(kind="ack", command_id=cmd.command_id, instance_id=lc.instance_id, payload={"ip": self.current.ip, "ssh_port": self.current.ssh_port}))
             self._boot_timer = asyncio.create_task(self._boot_watchdog(lc.instance_id))
 
@@ -225,6 +341,7 @@ class HostAgent:
         self.log.record("vm_destroyed", instance_id=handle.instance_id, reason=reason, node_agent_acked=acked, devices_reset=len(reset), nvme_sanitized=len(sanitized))
         self.current = None
         self.current_launch = None
+        self._save_current()
 
     async def _cmd_restart(self, cmd: HostCommand) -> None:
         if self.current is None:
@@ -243,6 +360,7 @@ class HostAgent:
                 old = self.current
                 self.current = await self.backend.launch(spec)
                 self.current.ssh_port = old.ssh_port
+        self._save_current()
         await self.platform.send(HostEvent(kind="ack", command_id=cmd.command_id, instance_id=self.current.instance_id, payload={"restarted": True}))
 
     async def _cmd_gpu_reset(self, cmd: HostCommand) -> None:
@@ -271,7 +389,24 @@ class HostAgent:
         await self.platform.send(HostEvent(kind="ack", command_id=cmd.command_id, node_id=self.node_id, payload={"maintenance_until": self.maintenance_until}))
 
     async def _cmd_bootstrap_identity(self, cmd: HostCommand) -> None:
-        """Boot a verify VM with a random nonce, derive gpu_ids from its evidence, write a registration draft."""
+        """Boot a verify VM with a random nonce, derive gpu_ids from its evidence, write a registration draft. With reuse=true the
+        stored identity (gpu_ids proven at the first bootstrap) is re-signed with this host's current profile, deployment tier and
+        claimed spec: no VM is needed, so a node can change its offer while a rental runs; validators re-verify the hardware at the
+        admission test that follows every re-registration."""
+        if cmd.payload.get("reuse"):
+            prev = self.cfg.state_dir / "registration.json"
+            if not prev.exists():
+                await self.platform.send(HostEvent(kind="error", command_id=cmd.command_id, payload={"error": "no stored registration to reuse; bootstrap without reuse"}))
+                return
+            old = RegistrationRecord.model_validate_json(prev.read_text())
+            rec = self._registration_record(old.gpu_ids, float(cmd.payload.get("network_gbps", old.claimed_spec.network_gbps)))
+            self._store_registration(rec)
+            self.log.record("identity_reused", node_id=rec.node_id, deployment=rec.deployment, profile=rec.profile)
+            reg_env = SignedEnvelope.create("registration", rec.model_dump(by_alias=True), self.key)
+            (self.cfg.state_dir / "registration.envelope.json").write_text(reg_env.model_dump_json(indent=1))
+            await self.platform.send(HostEvent(kind="identity", command_id=cmd.command_id, node_id=rec.node_id, payload={
+                "registration": rec.model_dump(by_alias=True), "registration_envelope": reg_env.model_dump(), "evidence": None, "reused": True}))
+            return
         loop = asyncio.get_running_loop()
         self._pending_identity = loop.create_future()
         image = cmd.payload.get("image", "verify")
@@ -290,18 +425,9 @@ class HostAgent:
         from racksdock_subnet.verifier.verifiers import split_chain
 
         gpu_ids = [gpu_id_from_cert_pem(split_chain(d.certificate)[0].public_bytes(serialization.Encoding.PEM)) for d in ev.bundle.devices]
-        node_id = node_id_from_gpu_ids(gpu_ids)
-        inv = self.backend.host_inventory()
-        rec = RegistrationRecord(
-            node_id=node_id, gpu_ids=gpu_ids, profile=current_profile().name, miner_hotkey=self.cfg.miner_hotkey, miner_service_key=self.key.public.hex,
-            claimed_spec=ClaimedSpec(vcpus=self.cfg.resources.vcpus, cpu_model=inv.get("cpu_model", ""), memory_gb=self.cfg.resources.memory_gb,
-                                     nvme_tb=round(sum(d.get("PhysicalSize", 0) for d in inv.get("nvme", [])) / 1e12, 1),
-                                     network_gbps=float(cmd.payload.get("network_gbps", 25)), region=self.cfg.region, oem_platform=self.cfg.oem_platform),
-            host_image_version=self.cfg.host_image_version, board_serial=inv.get("board_serial"),
-        )
-        self.node_id = node_id
-        (self.cfg.state_dir / "node_id").write_text(node_id + "\n")
-        (self.cfg.state_dir / "registration.json").write_text(rec.model_dump_json(by_alias=True, indent=1))
+        rec = self._registration_record(gpu_ids, float(cmd.payload.get("network_gbps", 25)))
+        node_id = rec.node_id
+        self._store_registration(rec)
         self.log.record("identity_bootstrapped", node_id=node_id)
         reg_env = SignedEnvelope.create("registration", rec.model_dump(by_alias=True), self.key)
         (self.cfg.state_dir / "registration.envelope.json").write_text(reg_env.model_dump_json(indent=1))
@@ -310,6 +436,22 @@ class HostAgent:
         async with self._lock:
             if self.current and self.current.instance_id == lc.instance_id:
                 await self._teardown_current(reason="bootstrap complete")
+
+    def _registration_record(self, gpu_ids: list[str], network_gbps: float) -> RegistrationRecord:
+        inv = self.backend.host_inventory()
+        return RegistrationRecord(
+            node_id=node_id_from_gpu_ids(gpu_ids), gpu_ids=gpu_ids, profile=current_profile().name, deployment=self.cfg.deployment, miner_hotkey=self.cfg.miner_hotkey,
+            miner_service_key=self.key.public.hex,
+            claimed_spec=ClaimedSpec(vcpus=self.cfg.resources.vcpus, cpu_model=inv.get("cpu_model", ""), memory_gb=self.cfg.resources.memory_gb,
+                                     nvme_tb=round(sum(d.get("PhysicalSize", 0) for d in inv.get("nvme", [])) / 1e12, 1),
+                                     network_gbps=network_gbps, region=self.cfg.region, oem_platform=self.cfg.oem_platform),
+            host_image_version=self.cfg.host_image_version, board_serial=inv.get("board_serial"),
+        )
+
+    def _store_registration(self, rec: RegistrationRecord) -> None:
+        self.node_id = rec.node_id
+        (self.cfg.state_dir / "node_id").write_text(rec.node_id + "\n")
+        (self.cfg.state_dir / "registration.json").write_text(rec.model_dump_json(by_alias=True, indent=1))
 
     # ---- node-agent messages -------------------------------------------------
     async def _on_agent_message(self, msg: AgentMessage) -> None:
@@ -323,6 +465,9 @@ class HostAgent:
             lc = self.current_launch
             if lc is None:
                 return
+            self._hello_count += 1
+            if self._hello_count in (5, 50, 500):
+                log.warning("node-agent for %s has reconnected %d times: it is probably crash-looping inside the VM", iid, self._hello_count)
             meta = Metadata(instance_id=iid, node_id=self.node_id, tenant_nonce=lc.tenant_nonce, mode=lc.mode.value, image_version=lc.image_version,
                             user_data=lc.user_data if self.cfg.metadata_carries_user_data else None, ssh_port=lc.ssh_port)
             await self.agentlink.send(AgentMessage(type="metadata", payload=meta.model_dump()))
@@ -332,6 +477,10 @@ class HostAgent:
                 ev = BootEvidence.model_validate(env.payload)
                 if self._pending_identity is not None and not self._pending_identity.done():
                     self._pending_identity.set_result(ev)
+            now = asyncio.get_running_loop().time()
+            if self.current.extra.get("active") is True and now - self._last_evidence_at < EVIDENCE_MIN_INTERVAL_S:
+                return  # already active: re-attestations come through validator challenges; a crash-looping agent is not relayed every 2 s
+            self._last_evidence_at = now
             await self.platform.send(HostEvent(kind="evidence", node_id=self.node_id, instance_id=iid, payload=env.model_dump()))
         elif msg.type == "status":
             upd = StatusUpdate.model_validate(msg.payload)
@@ -340,6 +489,7 @@ class HostAgent:
             upd.ssh_port = self.current.ssh_port
             if upd.status == InstanceStatus.active:
                 self.current.extra["active"] = True
+                self._save_current()
             await self.platform.send(HostEvent(kind="status", node_id=self.node_id, instance_id=iid, payload=upd.model_dump(mode="json")))
         elif msg.type == "challenge_response":
             nonce = (msg.payload.get("payload") or {}).get("nonce")
