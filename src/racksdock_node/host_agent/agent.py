@@ -414,17 +414,22 @@ class HostAgent:
         image_version = cmd.payload.get("image_version", "v0")
         # a fresh host is usually still downloading the catalog when the miner bootstraps: wait for the verify image instead of
         # failing, and tell the platform (the miner CLI shows these notes) what we are waiting for
-        if self.images is not None and not any(i.startswith(image_version + ":") for i in self.images):
+        def have_image() -> bool:
+            # the inventory is None until the first catalog sync has finished (the signed manifest is written last), so an
+            # unknown inventory means "still downloading", not "present"
+            return self.images is not None and any(i.startswith(image_version + ":") for i in self.images)
+
+        if not (self.cfg.sim or self.cfg.static) and not have_image():
             waited = 0.0
-            while waited < self.cfg.catalog_wait_s and not any(i.startswith(image_version + ":") for i in (self.images or [])):
+            while waited < self.cfg.catalog_wait_s and not have_image():
                 if waited % 60 == 0:
-                    msg = f"waiting for catalog image {image_version} (download in progress, {int(waited)}s so far)"
+                    msg = f"waiting for catalog image {image_version} (first download in progress, {int(waited)}s so far)"
                     log.info("bootstrap: %s", msg)
                     await self.platform.send(HostEvent(kind="log", command_id=cmd.command_id, payload={"message": msg}))
                 await asyncio.sleep(10)
                 waited += 10
                 self.images = await asyncio.to_thread(self._inventory)
-            if not any(i.startswith(image_version + ":") for i in (self.images or [])):
+            if not have_image():
                 await self.platform.send(HostEvent(kind="error", command_id=cmd.command_id, payload={"error": f"catalog image {image_version} is not on this host after {int(waited)}s; check `journalctl -u racksdock-host-agent` for the catalog sync"}))
                 return
         self._pending_identity = loop.create_future()
