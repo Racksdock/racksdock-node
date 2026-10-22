@@ -11,7 +11,8 @@
 #                  empty = single-box test: a local dev CA is created in /etc/racksdock/devca (the marketplace reuses it)
 #   PLATFORM_WS    host-agent WebSocket (default: PLATFORM_URL with ws:// and /v1/hosts/ws)
 #   MINER_HOTKEY   ss58 hotkey written into host-agent.env (default: placeholder for tests)
-#   REGION         region label (default: lab)
+#   REGION         where the server is, as a short lowercase code tenants can filter on (required), e.g. eu-north-1, us-west-2,
+#                  ap-northeast-1, or <country>-<city>-<n> like de-fra-1; it goes into the registration record
 #   PROFILE        RACKSDOCK_PROFILE (default: b300x8)
 #   TRUST_MODE     prod | dev (dev: GPUs without device attestation, e.g. Ampere/Ada test boxes; default prod)
 #   DEPLOYMENT     vm (default: KVM VM, needs bare metal or nested virtualization) | dual (bare metal offering BOTH tiers: the
@@ -37,7 +38,15 @@ REPOS="${REPOS:-$(cd "$HERE/../../.." && pwd)}"
 PLATFORM_URL="${PLATFORM_URL:-}"
 PROFILE="${PROFILE:-b300x8}"; TRUST_MODE="${TRUST_MODE:-prod}"; NET_MODE="${NET_MODE:-nat}"; NAT_SSH_PORT="${NAT_SSH_PORT:-20022}"
 DEPLOYMENT="${DEPLOYMENT:-vm}"
-REGION="${REGION:-lab}"; MINER_HOTKEY="${MINER_HOTKEY:-5FminerTest}"
+REGION="${REGION:-}"; MINER_HOTKEY="${MINER_HOTKEY:-}"
+if [ -z "$REGION" ] || ! [[ "$REGION" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+){1,3}$ ]]; then
+  echo "REGION is required: a short lowercase location code such as eu-north-1, us-west-2, ap-northeast-1 or de-fra-1 (got '${REGION:-<empty>}')" >&2
+  exit 1
+fi
+if [ -z "$MINER_HOTKEY" ]; then
+  echo "MINER_HOTKEY is required: the ss58 hotkey registered on the subnet that will own this node" >&2
+  exit 1
+fi
 export DEBIAN_FRONTEND=noninteractive
 step() { echo; echo "== $*"; }
 
