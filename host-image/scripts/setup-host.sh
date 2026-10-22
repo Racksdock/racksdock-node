@@ -11,8 +11,8 @@
 #                  empty = single-box test: a local dev CA is created in /etc/racksdock/devca (the marketplace reuses it)
 #   PLATFORM_WS    host-agent WebSocket (default: PLATFORM_URL with ws:// and /v1/hosts/ws)
 #   MINER_HOTKEY   ss58 hotkey written into host-agent.env (default: placeholder for tests)
-#   REGION         where the server is, as a short lowercase code tenants can filter on (required), e.g. eu-north-1, us-west-2,
-#                  ap-northeast-1, or <country>-<city>-<n> like de-fra-1; it goes into the registration record
+#   REGION         optional label (datacenter / city, e.g. de-fra-1). The platform detects the node's country from the host
+#                  agent's address; the label is shown alongside and never overrides it
 #   PROFILE        RACKSDOCK_PROFILE (default: b300x8)
 #   TRUST_MODE     prod | dev (dev: GPUs without device attestation, e.g. Ampere/Ada test boxes; default prod)
 #   DEPLOYMENT     vm (default: KVM VM, needs bare metal or nested virtualization) | dual (bare metal offering BOTH tiers: the
@@ -39,8 +39,10 @@ PLATFORM_URL="${PLATFORM_URL:-}"
 PROFILE="${PROFILE:-b300x8}"; TRUST_MODE="${TRUST_MODE:-prod}"; NET_MODE="${NET_MODE:-nat}"; NAT_SSH_PORT="${NAT_SSH_PORT:-20022}"
 DEPLOYMENT="${DEPLOYMENT:-vm}"
 REGION="${REGION:-}"; MINER_HOTKEY="${MINER_HOTKEY:-}"
-if [ -z "$REGION" ] || ! [[ "$REGION" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+){1,3}$ ]]; then
-  echo "REGION is required: a short lowercase location code such as eu-north-1, us-west-2, ap-northeast-1 or de-fra-1 (got '${REGION:-<empty>}')" >&2
+# the node's location is detected by the platform from the address this host agent connects from (country-level GeoIP);
+# REGION is an optional label the miner may add (datacenter, city) and never overrides the detected country
+if [ -n "$REGION" ] && ! [[ "$REGION" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+){0,3}$ ]]; then
+  echo "REGION must be a short lowercase label such as de-fra-1 or eu-north-1 (got '$REGION'); it is optional" >&2
   exit 1
 fi
 if [ -z "$MINER_HOTKEY" ]; then
