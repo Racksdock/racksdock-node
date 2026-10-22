@@ -54,6 +54,7 @@ class HostAgentConfig:
     resources: VmResources = field(default_factory=VmResources)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     heartbeat_interval_s: float = 30.0
+    catalog_wait_s: float = 1800.0  # bootstrap waits this long for the verify image to arrive from the catalog
     catalog_url: str | None = None  # platform image store (default: http://<platform host>/catalog/current); empty string disables sync
     catalog_sync_s: float = 600.0
     boot_timeout_s: float = 900.0
@@ -127,6 +128,7 @@ class HostAgentConfig:
             agent_port=int(e("RACKSDOCK_AGENT_PORT", str(VSOCK_PORT))),
             agent_transport=e("RACKSDOCK_AGENT_TRANSPORT", "vsock"),
             heartbeat_interval_s=float(e("RACKSDOCK_HEARTBEAT_S", "30")),
+            catalog_wait_s=float(e("RACKSDOCK_CATALOG_WAIT_S", "1800")),
             catalog_url=e("RACKSDOCK_CATALOG_URL"), catalog_sync_s=float(e("RACKSDOCK_CATALOG_SYNC_S", "600")),
             sim_node_dir=Path(e("RACKSDOCK_SIM_NODE_DIR")) if e("RACKSDOCK_SIM_NODE_DIR") else None,
             sim_node_agent_cmd=e("RACKSDOCK_SIM_NODE_AGENT_CMD", "racksdock-node-agent"),

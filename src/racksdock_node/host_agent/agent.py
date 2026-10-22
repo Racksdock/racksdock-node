@@ -62,6 +62,7 @@ class HostAgent:
         self.current: VmHandle | None = None
         self.current_launch: LaunchCommand | None = None
         self.images: list[str] | None = None  # catalog images present ("<version>:<kind>"); None until the first inventory
+        self.last_launch_error: str | None = None
         self.maintenance_until: str | None = None
         self._pending_identity: asyncio.Future | None = None
         self._teardown_ack: asyncio.Event = asyncio.Event()
@@ -295,6 +296,7 @@ class HostAgent:
                 self.current = await self.backend.launch(spec)
             except Exception as e:
                 self.current_launch = None
+                self.last_launch_error = f"launch failed: {str(e)[:600]}"
                 log.error("launch of %s (%s) failed: %s", lc.instance_id, lc.deployment or self.cfg.deployment, str(e)[:1500])
                 await self._status(lc.instance_id, InstanceStatus.error, f"launch failed: {e}")
                 return
@@ -408,12 +410,32 @@ class HostAgent:
                 "registration": rec.model_dump(by_alias=True), "registration_envelope": reg_env.model_dump(), "evidence": None, "reused": True}))
             return
         loop = asyncio.get_running_loop()
-        self._pending_identity = loop.create_future()
         image = cmd.payload.get("image", "verify")
         image_version = cmd.payload.get("image_version", "v0")
+        # a fresh host is usually still downloading the catalog when the miner bootstraps: wait for the verify image instead of
+        # failing, and tell the platform (the miner CLI shows these notes) what we are waiting for
+        if self.images is not None and not any(i.startswith(image_version + ":") for i in self.images):
+            waited = 0.0
+            while waited < self.cfg.catalog_wait_s and not any(i.startswith(image_version + ":") for i in (self.images or [])):
+                if waited % 60 == 0:
+                    msg = f"waiting for catalog image {image_version} (download in progress, {int(waited)}s so far)"
+                    log.info("bootstrap: %s", msg)
+                    await self.platform.send(HostEvent(kind="log", command_id=cmd.command_id, payload={"message": msg}))
+                await asyncio.sleep(10)
+                waited += 10
+                self.images = await asyncio.to_thread(self._inventory)
+            if not any(i.startswith(image_version + ":") for i in (self.images or [])):
+                await self.platform.send(HostEvent(kind="error", command_id=cmd.command_id, payload={"error": f"catalog image {image_version} is not on this host after {int(waited)}s; check `journalctl -u racksdock-host-agent` for the catalog sync"}))
+                return
+        self._pending_identity = loop.create_future()
+        self.last_launch_error = None
         lc = LaunchCommand(instance_id=f"bootstrap-{secrets.token_hex(4)}", node_id=self.node_id or "", mode=VmMode.verify, image=image,
                            image_version=image_version, user_data="#cloud-config\n{}\n", tenant_nonce=secrets.token_hex(32))
         await self._cmd_launch(HostCommand(kind="launch", command_id=cmd.command_id + ":launch", instance_id=lc.instance_id, payload=lc.model_dump(mode="json")))
+        if self.current is None or self.current.instance_id != lc.instance_id:
+            self._pending_identity = None
+            await self.platform.send(HostEvent(kind="error", command_id=cmd.command_id, payload={"error": self.last_launch_error or "bootstrap VM did not start"}))
+            return
         try:
             ev: BootEvidence = await asyncio.wait_for(self._pending_identity, timeout=self.cfg.boot_timeout_s)
         except TimeoutError:
