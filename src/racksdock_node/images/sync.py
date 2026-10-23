@@ -100,6 +100,21 @@ def local_images(image_dir: Path, kinds: tuple[str, ...] = ("vm", "container"), 
     return sorted(out)
 
 
+def vm_image_path(image_dir: Path, version: str, os_name: str | None = None, pub: str | None = None) -> Path:
+    """The qcow2 behind a catalog version. A patch release keeps an unchanged image under the new version with its old file
+    name (`ImageEntry.file`), so the name comes from the host's verified manifest; <version>.qcow2 when there is no manifest."""
+    sm = image_dir / "manifest.signed.json"
+    try:
+        env = SignedEnvelope.model_validate_json(sm.read_text())
+        if env.verify(expected_signer=pub or (image_dir / "catalog.pub").read_text().strip()):
+            for e in CatalogManifest.model_validate(env.payload).images:
+                if e.kind == "vm" and e.version == version and (os_name is None or e.os == os_name):
+                    return image_dir / e.file
+    except Exception:
+        pass
+    return image_dir / f"{version}.qcow2"
+
+
 def fetch_manifest(catalog_url: str, pin: Path | None = PIN_PATH) -> tuple[CatalogManifest, str, str]:
     """Download + verify the signed manifest. Returns (manifest, signed_json, pubkey_hex). The public key is pinned at `pin` on
     first contact; a later key change is refused (the operator replaces the pin deliberately)."""

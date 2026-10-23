@@ -146,3 +146,20 @@ def test_store_specific_image_id_is_accepted_for_a_verified_archive(store, tmp_p
     assert sy.local_images(dest, ("container",)) == ["pytorch-2.9-cuda13.0_v2026.10.9:container"]
     entry = [e for e in m.images if e.kind == "container"][0]
     assert sy.container_id_ok(dest, entry, "sha256:" + "e" * 64) and not sy.container_id_ok(dest, entry, "sha256:" + "f" * 64)
+
+
+def test_vm_image_path_follows_the_manifest_file_name(tmp_path):
+    """A patch release keeps an unchanged qcow2 under the new version with its old file name (publish-patch-release.sh); the
+    host-agent must open that file, not <version>.qcow2 (seen: every verify launch failed with 'verify_v2026.10.2.qcow2 not found')."""
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    entries = [ImageEntry(os="verify", version="verify_v2026.10.2", file="verify_v2026.10.1.qcow2", sha256="c" * 64, size_bytes=1, kind="vm", validator_only=True),
+               ImageEntry(os="verify", version="verify_v2026.10.2", file="racksdock/verify:v2026.10.2", sha256="sha256:" + "d" * 64, size_bytes=1, kind="container")]
+    key = SigningKey.generate()
+    (img_dir / "manifest.signed.json").write_text(sign_manifest(CatalogManifest(release="v2026.10.2", images=entries), key).model_dump_json())
+    (img_dir / "catalog.pub").write_text(key.public.hex + "\n")
+    assert sy.vm_image_path(img_dir, "verify_v2026.10.2", "verify") == img_dir / "verify_v2026.10.1.qcow2"
+    assert sy.vm_image_path(img_dir, "ubuntu24.04_v2026.10.1", "ubuntu24.04") == img_dir / "ubuntu24.04_v2026.10.1.qcow2"  # not in the manifest: the plain name
+    (img_dir / "catalog.pub").write_text(SigningKey.generate().public.hex + "\n")  # a manifest that does not verify is not trusted for file names
+    assert sy.vm_image_path(img_dir, "verify_v2026.10.2", "verify") == img_dir / "verify_v2026.10.2.qcow2"
+    assert sy.vm_image_path(tmp_path / "nowhere", "verify_v1") == tmp_path / "nowhere" / "verify_v1.qcow2"

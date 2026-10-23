@@ -111,7 +111,7 @@ def test_vendor_data_carries_dev_material_root_only():
 
 def test_host_agent_dev_guest_files_and_image_path(tmp_path):
     """Dev trust mode hands the dev CA certificates (never its private keys) and the node's simulated identity to the VM; images are
-    addressed by their catalog version (<os>_<release>.qcow2)."""
+    addressed by their catalog version through the host's manifest."""
     ca_dir = tmp_path / "devca"
     DevCA.create(ca_dir)
     node_dir = tmp_path / "node"
@@ -134,7 +134,7 @@ def test_host_agent_dev_guest_files_and_image_path(tmp_path):
     cfg_prod = HostAgentConfig(mode="real", state_dir=tmp_path / "state2", key_path=tmp_path / "state2" / "host.seed", trust=TrustConfig(mode="prod", dev_ca_dir=None))
     assert HostAgent(cfg_prod, backend=NoBackend())._dev_guest_files() == {}
     src = (Path(__file__).parents[2] / "src/racksdock_node/host_agent/agent.py").read_text()
-    assert 'f"{lc.image_version}.qcow2"' in src
+    assert "vm_image_path(self.cfg.image_dir, lc.image_version, lc.image)" in src  # the file name comes from the manifest (patch releases)
 
 
 def test_seed_iso_roundtrip(tmp_path):

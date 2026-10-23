@@ -272,6 +272,8 @@ class HostAgent:
         await self.platform.send(HostEvent(kind="ack", command_id=cmd.command_id, node_id=self.node_id, payload={"pong": True}))
 
     async def _cmd_launch(self, cmd: HostCommand) -> None:
+        from racksdock_node.images.sync import vm_image_path
+
         lc = LaunchCommand.model_validate(cmd.payload)
         async with self._lock:
             if self.current is not None:
@@ -285,7 +287,7 @@ class HostAgent:
                             image_version=lc.image_version, user_data=lc.user_data, ssh_port=lc.ssh_port)
             spec = VmSpec(instance_id=lc.instance_id, image=lc.image, image_version=lc.image_version, user_data=lc.user_data, metadata=meta,
                           resources=self.cfg.resources, vm_dir=self.cfg.vm_dir / lc.instance_id,
-                          image_path=self.cfg.image_dir / f"{lc.image_version}.qcow2", hostname=f"racksdock-{lc.instance_id[-8:]}", deployment=lc.deployment,
+                          image_path=vm_image_path(self.cfg.image_dir, lc.image_version, lc.image), hostname=f"racksdock-{lc.instance_id[-8:]}", deployment=lc.deployment,
                           public_ip=self.cfg.network.public_ip, ssh_port=lc.ssh_port,
                           operator_keys=(self.cfg.dev_ssh_pubkey.strip() + "\n") if self.cfg.dev_ssh_pubkey and lc.instance_id.startswith("bootstrap-") else None)
             self.current_launch = lc
