@@ -12,7 +12,7 @@ dependencies = ["racksdock-subnet", "pydantic>=2.5", "websockets>=12", "pycdlib>
 
 [project.optional-dependencies]
 nvml = ["nvidia-ml-py>=12"]
-test = ["pytest>=8", "pytest-asyncio>=0.23"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "asyncssh>=2.14"]  # the static backend test drives a real ssh server
 dev = ["ruff>=0.5"]
 
 [project.scripts]
