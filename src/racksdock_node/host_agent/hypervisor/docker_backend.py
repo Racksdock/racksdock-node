@@ -263,7 +263,7 @@ class DockerBackend:
     async def state(self, handle: VmHandle) -> str:
         cp = await _run("docker", "inspect", "--format", "{{.State.Status}}", handle.name, check=False)
         st = cp.stdout.strip()
-        return {"running": "running", "exited": "shut off", "created": "shut off", "paused": "paused", "restarting": "running"}.get(st, "unknown" if not st else st)
+        return {"running": "running", "exited": "shut off", "created": "shut off", "paused": "paused", "restarting": "running"}.get(st, st or "unknown")
 
     async def cleanup_stale(self, vm_root: Path, keep: VmHandle | None = None) -> list[str]:
         """A rental container the agent has no record of is removed with its volume; the adopted one (`keep`) stays."""
