@@ -79,8 +79,8 @@ def test_container_inventory_uses_docker_image_ids(store, tmp_path, monkeypatch)
 def test_host_agent_image_kinds_and_catalog_url():
     from racksdock_node.host_agent.config import HostAgentConfig
 
-    cfg = HostAgentConfig(mode="dual", platform_ws="ws://62.83.43.83:8000/v1/hosts/ws")
-    assert cfg.image_kinds == ("vm", "container") and cfg.effective_catalog_url == "http://62.83.43.83:8000/catalog/current"
+    cfg = HostAgentConfig(mode="dual", platform_ws="wss://api.racksdock.com/v1/hosts/ws")
+    assert cfg.image_kinds == ("vm", "container") and cfg.effective_catalog_url == "https://api.racksdock.com/catalog/current"
     assert HostAgentConfig(mode="docker").image_kinds == ("container",) and HostAgentConfig(mode="real").image_kinds == ("vm",)
     assert HostAgentConfig(mode="real", catalog_url="").effective_catalog_url is None
     assert HostAgentConfig(mode="real", platform_ws="wss://p.example/v1/hosts/ws").effective_catalog_url == "https://p.example/catalog/current"

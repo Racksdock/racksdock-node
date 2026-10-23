@@ -28,7 +28,7 @@ machine can reach `172.19.4.67:20022`; see §6.
 | `racksdock-miner bootstrap` | miner neuron: registers the node from the bootstrap VM's evidence | `run_vm_test.py` |
 | `racksdock-validator run` | validator: admission, qualification, canaries, in-rental checks, weights | `run_vm_test.py` |
 | `racksdock` CLI | tenant journey (sign-up, key, create, attestation-verified ssh, delete) | `run_vm_test.py` |
-| `iperf3 -s` | Q12 endpoint (host side of the virtual NIC; use `--iperf 62.83.43.83` for a real link if that server runs `iperf3 -s`) | `run_vm_test.py` |
+| `iperf3 -s` | Q12 endpoint (host side of the virtual NIC; use `--iperf <validator ip>` for a real link if that server runs `iperf3 -s`) | `run_vm_test.py` |
 
 Wallets: not needed. The chain is the mock JSON file; hotkeys are placeholder strings. Nothing talks to Bittensor.
 
